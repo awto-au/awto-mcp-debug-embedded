@@ -352,6 +352,87 @@ Found 1 stlink programmers
 
 
 # ---------------------------------------------------------------------------
+# TestDebugWorkflow — managed session orchestration helpers
+# ---------------------------------------------------------------------------
+
+class TestDebugWorkflow(unittest.TestCase):
+    """Tests for debug_workflow high-level orchestration paths."""
+
+    def setUp(self) -> None:
+        import debug_workflow as wf
+        wf._SESSIONS.clear()
+        self.wf = wf
+
+    def test_start_session_binds_serial_and_info(self) -> None:
+        with patch.object(self.wf, "_pick_stlink_serial", return_value="SER1"):
+            with patch.object(self.wf.stlink, "chip_info", return_value={"chip_id": "0x450"}):
+                session = self.wf.start_session(target_kind="stlink", serial=None)
+        self.assertEqual(session["serial"], "SER1")
+        self.assertEqual(session["target_info"]["chip_id"], "0x450")
+        self.assertEqual(len(session["events"]), 1)
+
+    def test_session_memory_snapshot_delegates_to_stlink(self) -> None:
+        with patch.object(self.wf, "_pick_stlink_serial", return_value="SER2"):
+            with patch.object(self.wf.stlink, "chip_info", return_value={"chip_id": "0x450"}):
+                session = self.wf.start_session(target_kind="stlink", serial=None)
+
+        with patch.object(self.wf.stlink, "dump_memory_snapshot", return_value={"files": {"flash": "/tmp/f.bin"}}):
+            result = self.wf.session_memory_snapshot(
+                session_id=session["id"],
+                output_dir="/tmp/out",
+                include_flash=True,
+                include_ram=False,
+            )
+        self.assertEqual(result["serial"], "SER2")
+        self.assertIn("files", result["result"])
+
+    def test_safe_flash_cycle_requires_explicit_confirmation(self) -> None:
+        with patch.object(self.wf, "_pick_stlink_serial", return_value="SER3"):
+            with patch.object(self.wf.stlink, "chip_info", return_value={"chip_id": "0x450", "flash_size_kb": 128}):
+                session = self.wf.start_session(target_kind="stlink", serial=None)
+
+        with self.assertRaises(RuntimeError):
+            self.wf.session_safe_flash_cycle(
+                session_id=session["id"],
+                output_dir="/tmp/out",
+                confirm_destructive=False,
+            )
+
+    def test_safe_flash_cycle_reports_restore_match(self) -> None:
+        with patch.object(self.wf, "_pick_stlink_serial", return_value="SER4"):
+            with patch.object(self.wf.stlink, "chip_info", return_value={"chip_id": "0x450", "flash_size_kb": 1}):
+                session = self.wf.start_session(target_kind="stlink", serial=None)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Simulate read/erase/read/restore/read by writing test bytes in mocked flash_read/write behavior.
+            pre_data = b"A" * 1024
+            erased_data = b"\xFF" * 1024
+            post_data = b"A" * 1024
+            call_idx = {"n": 0}
+
+            def fake_flash_read(output_path: str, _addr: str, _length: int, _serial: str) -> str:
+                call_idx["n"] += 1
+                data = pre_data if call_idx["n"] == 1 else erased_data if call_idx["n"] == 2 else post_data
+                Path(output_path).write_bytes(data)
+                return "ok"
+
+            with patch.object(self.wf.stlink, "flash_read", side_effect=fake_flash_read):
+                with patch.object(self.wf.stlink, "flash_erase", return_value="ok"):
+                    with patch.object(self.wf.stlink, "flash_write", return_value="ok"):
+                        with patch.object(self.wf.stlink, "reset_target", return_value="ok"):
+                            with patch.object(self.wf.stlink, "chip_info", return_value={"chip_id": "0x450", "flash_size_kb": 1}):
+                                result = self.wf.session_safe_flash_cycle(
+                                    session_id=session["id"],
+                                    output_dir=tmpdir,
+                                    confirm_destructive=True,
+                                    flash_length=1024,
+                                )
+
+        self.assertTrue(result["restore_match"])
+        self.assertIn("summary_file", result)
+
+
+# ---------------------------------------------------------------------------
 # TestMiParser — GDB/MI response parsing (pure unit, no socket)
 # ---------------------------------------------------------------------------
 

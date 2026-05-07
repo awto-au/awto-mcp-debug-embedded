@@ -50,6 +50,13 @@ Add to your workspace `.vscode/mcp.json` (already present):
 - `probe_list()` — list attached ST-Link probes + report available CLI backends
 - `probe_info(serial?)` — MCU device-id, flash size, UID
 
+### Managed Workflows (preferred for AI agents)
+`debug_session_start`, `debug_session_status`, `debug_session_memory_snapshot`,
+`debug_session_safe_flash_cycle`, `debug_session_report`
+
+These tools move sequencing and safety policy into the MCP server so clients can
+request intent-level actions instead of manually orchestrating low-level commands.
+
 ### ST-Link open-source (st-flash / st-info / st-util)
 `stlink_flash`, `stlink_erase`, `stlink_read`, `stlink_verify`, `stlink_reset`,
 `stlink_memory_snapshot`, `stlink_gdb_start`, `stlink_gdb_stop`,
