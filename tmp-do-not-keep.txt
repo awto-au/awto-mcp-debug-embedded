@@ -1,1 +1,1 @@
-This file is temporary and can be deleted in a follow-up cleanup.
+Temporary marker.
