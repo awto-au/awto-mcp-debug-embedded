@@ -2,6 +2,10 @@
 
 MCP server exposing embedded debugger tools to AI agents (Copilot, Claude, etc.).
 
+Registry files:
+- `probes.json` tracks known debug probes/adapters and approval state.
+- `cpus.json` tracks discovered target CPUs and approval state.
+
 ## Why this server exists
 
 MCP is useful, but embedded teams need more than tool access. This server is
@@ -16,6 +20,11 @@ designed around three practical goals:
 
 The result is lower iteration cost when failures happen, especially for
 multi-target bring-up and recovery scenarios.
+
+## Known test target
+
+- STM32F4-Discovery can be used as a hardware validation board for STM32
+    workflows in this server.
 
 Supports:
 - **ST-Link open-source tools** (`st-flash`, `st-info`, `st-util`, `st-trace`)
@@ -64,6 +73,18 @@ Add to your workspace `.vscode/mcp.json` (already present):
 ### Probe discovery
 - `probe_list()` — list attached ST-Link probes + report available CLI backends
 - `probe_info(serial?)` — MCU device-id, flash size, UID
+
+Approval policy:
+- Newly discovered probes and CPUs are registered as `pending`.
+- MCP operations are blocked for pending/ignored devices.
+- User approval is required before use (`probe_approve`, `cpu_approve`).
+
+### CPU registry
+`cpu_list`, `cpu_approve`, `cpu_ignore`, `cpu_forget`
+
+Identity rules:
+- ESP CPUs are keyed by MAC address.
+- STM32 CPUs are keyed by CPU type (`device_name` / family string).
 
 ### Managed Workflows (preferred for AI agents)
 `debug_session_start`, `debug_session_set_mode`, `debug_session_status`,

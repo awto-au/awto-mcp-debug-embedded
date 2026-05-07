@@ -131,6 +131,44 @@ class TestRegistryOps(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# TestCpuRegistryOps — CPU registry identity and approval flow
+# ---------------------------------------------------------------------------
+
+class TestCpuRegistryOps(unittest.TestCase):
+    """Tests for cpu_registry.json lifecycle and identity behavior."""
+
+    def setUp(self) -> None:
+        self._tmpdir = tempfile.mkdtemp()
+        self._cpu_path = os.path.join(self._tmpdir, "cpus.json")
+        import cpu_registry as cr
+        cr.configure_registry(self._cpu_path)
+        self.cr = cr
+
+    def test_register_stm32_defaults_to_pending(self) -> None:
+        row = self.cr.register_stm32(cpu_type="STM32F407VG", probe_serial="ST1")
+        self.assertEqual(row["kind"], "stm32")
+        self.assertEqual(row["state"], "pending")
+        self.assertEqual(row["id"], "stm32:stm32f407vg")
+
+    def test_register_esp_uses_mac_identity(self) -> None:
+        row = self.cr.register_esp(mac="AA:BB:CC:DD:EE:FF", chip_type="esp32s3", port="/dev/ttyUSB0")
+        self.assertEqual(row["id"], "esp:aa:bb:cc:dd:ee:ff")
+        self.assertEqual(row["state"], "pending")
+
+    def test_approve_cpu_changes_state(self) -> None:
+        row = self.cr.register_stm32(cpu_type="STM32H743", probe_serial="ST2")
+        approved = self.cr.approve_cpu(row["id"])
+        self.assertIsNotNone(approved)
+        self.assertEqual(approved["state"], "approved")
+
+    def test_ignore_and_clear_cpu(self) -> None:
+        row = self.cr.register_esp(mac="11:22:33:44:55:66", chip_type="esp32")
+        self.assertTrue(self.cr.ignore_cpu(row["id"]))
+        self.assertTrue(self.cr.clear_cpu(row["id"]))
+        self.assertIsNone(self.cr.get_cpu(row["id"]))
+
+
+# ---------------------------------------------------------------------------
 # TestProbeDetect — enumeration with mocked pyusb
 # ---------------------------------------------------------------------------
 

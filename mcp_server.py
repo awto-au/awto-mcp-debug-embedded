@@ -47,6 +47,7 @@ import debugger_esp as esp
 import debugger_stlink as stlink
 import debug_workflow as wf
 import probe_detect as pd
+import cpu_registry as cr
 from gdb_client import get_client as _gdb
 from process_manager import get_manager as _mgr
 
@@ -98,13 +99,15 @@ mcp = FastMCP(
     instructions="""
 Control embedded debug probes for STM32 (ST-Link) and Espressif ESP32/ESP32-S3 targets.
 
-FIRST USE — Probe approval flow:
+FIRST USE — Device approval flow:
 1. Call probe_list() to see all detected probes (ST-Link and ESP serial adapters).
 2. For any probe with state="pending", show the list to the user and ask:
    - Which probes to use (approve) — optionally assign a short nickname.
    - Which probes to ignore (will be hidden in future sessions).
 3. Call probe_approve(serial=..., nick=...) for each approved probe.
 4. Call probe_ignore(serial=...) for probes the user does not want.
+5. After CPU discovery, call cpu_list() and have the user approve pending CPU
+    entries with cpu_approve(cpu_id) before running debug/flash operations.
 
 The monitor runs continuously — if a new probe is plugged in, probe_list()
 will show it as "pending" and the approval flow should be repeated.
@@ -152,6 +155,98 @@ def _on_probe_disconnect(probe: pd.ProbeInfo) -> None:
         "** Probe disconnected: %s %s",
         probe.model, probe.serial[-8:],
     )
+
+
+def _resolve_approved_stlink_serial(serial: Optional[str]) -> str:
+    probes = [p for p in pd.get_all_probes() if p.kind == "stlink"]
+    approved = [p for p in probes if p.state == "approved"]
+    pending = [p for p in probes if p.state == "pending"]
+
+    if serial:
+        match = next((p for p in probes if p.serial == serial), None)
+        if not match:
+            raise RuntimeError(
+                f"Probe {serial!r} is unknown. Call probe_list() and approve it first."
+            )
+        if match.state != "approved":
+            raise RuntimeError(
+                f"Probe {serial!r} is state={match.state!r}. "
+                "Ask the user to approve via probe_approve(serial, nick) before use."
+            )
+        return serial
+
+    if len(approved) == 1:
+        return approved[0].serial
+    if len(approved) > 1:
+        choices = [p.serial for p in approved]
+        raise RuntimeError(f"Multiple approved ST-Link probes found; pass serial explicitly: {choices}")
+    if pending:
+        pending_serials = [p.serial for p in pending]
+        raise RuntimeError(
+            "No approved ST-Link probe available. "
+            f"Pending probes require user approval first: {pending_serials}"
+        )
+    raise RuntimeError("No ST-Link probe available. Call probe_list() and approve a probe first.")
+
+
+def _resolve_approved_esp_port(port: Optional[str]) -> str:
+    probes = [p for p in pd.get_all_probes() if p.kind == "esp"]
+    approved = [p for p in probes if p.state == "approved"]
+    pending = [p for p in probes if p.state == "pending"]
+
+    if port:
+        match = next((p for p in probes if p.port == port), None)
+        if not match:
+            raise RuntimeError(
+                f"ESP adapter at port {port!r} is unknown. Call probe_list() and approve it first."
+            )
+        if match.state != "approved":
+            raise RuntimeError(
+                f"ESP adapter {port!r} is state={match.state!r}. "
+                "Ask the user to approve via probe_approve(serial, nick) before use."
+            )
+        return port
+
+    approved_with_port = [p for p in approved if p.port]
+    if len(approved_with_port) == 1:
+        return approved_with_port[0].port
+    if len(approved_with_port) > 1:
+        ports = [p.port for p in approved_with_port]
+        raise RuntimeError(f"Multiple approved ESP adapters found; pass port explicitly: {ports}")
+    if pending:
+        pending_serials = [p.serial for p in pending]
+        raise RuntimeError(
+            "No approved ESP adapter available. "
+            f"Pending adapters require user approval first: {pending_serials}"
+        )
+    raise RuntimeError("No ESP adapter available. Call probe_list() and approve an adapter first.")
+
+
+def _register_and_require_stm32_cpu(info: dict[str, Any], probe_serial: Optional[str]) -> dict[str, Any]:
+    cpu_type = str(info.get("device_name") or info.get("chip_id") or "").strip()
+    if not cpu_type:
+        return {"state": "approved", "id": "stm32:unknown"}
+    row = cr.register_stm32(cpu_type=cpu_type, probe_serial=probe_serial, details=info)
+    if row.get("state") != "approved":
+        raise RuntimeError(
+            "CPU requires approval before use. "
+            f"Ask the user to approve CPU entry {row.get('id')!r} via cpu_approve()."
+        )
+    return row
+
+
+def _register_and_require_esp_cpu(info: dict[str, Any], port: Optional[str]) -> dict[str, Any]:
+    mac = str(info.get("mac") or "").strip()
+    chip_type = str(info.get("chip_type") or "unknown")
+    if not mac:
+        raise RuntimeError("Could not read ESP MAC; run esp_chip_info() after checking connection.")
+    row = cr.register_esp(mac=mac, chip_type=chip_type, port=port, details=info)
+    if row.get("state") != "approved":
+        raise RuntimeError(
+            "CPU requires approval before use. "
+            f"Ask the user to approve CPU entry {row.get('id')!r} via cpu_approve()."
+        )
+    return row
 
 
 # ---------------------------------------------------------------------------
@@ -290,19 +385,22 @@ def probe_info(serial: Optional[str] = None) -> dict[str, Any]:
     Args:
         serial: ST-Link probe serial (optional — uses first found if omitted).
     """
+    resolved_serial = _resolve_approved_stlink_serial(serial)
     errors: list[str] = []
     # Try st-info
     try:
-        info = stlink.chip_info(serial)
+        info = stlink.chip_info(resolved_serial)
         info["backend"] = "st-info"
+        _register_and_require_stm32_cpu(info, resolved_serial)
         return info
     except RuntimeError as exc:
         errors.append(f"st-info: {exc}")
 
     # Try CubeProgrammer
     try:
-        info = cube.probe_info(serial)
+        info = cube.probe_info(resolved_serial)
         info["backend"] = "cube"
+        _register_and_require_stm32_cpu(info, resolved_serial)
         return info
     except RuntimeError as exc:
         errors.append(f"cube: {exc}")
@@ -311,6 +409,54 @@ def probe_info(serial: Optional[str] = None) -> dict[str, Any]:
         "Could not read target info from any available backend. "
         + " | ".join(errors)
     )
+
+
+# ---------------------------------------------------------------------------
+# ── CPU registry tools ─────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def cpu_list(kind: Optional[str] = None) -> dict[str, Any]:
+    """List registered CPUs and show which entries await approval."""
+    cpus = cr.list_cpus(kind=kind)
+    pending = [row.get("id") for row in cpus if row.get("state") == "pending"]
+    result: dict[str, Any] = {
+        "cpus": cpus,
+        "pending": pending,
+    }
+    if pending:
+        result["message"] = (
+            f"{len(pending)} CPU entry(s) await approval. "
+            "Show the list to the user and call cpu_approve(cpu_id) or cpu_ignore(cpu_id)."
+        )
+    return result
+
+
+@mcp.tool()
+def cpu_approve(cpu_id: str) -> dict[str, Any]:
+    """Approve a CPU entry for use."""
+    row = cr.approve_cpu(cpu_id)
+    if not row:
+        return {"ok": False, "error": f"CPU entry {cpu_id!r} not found"}
+    return {"ok": True, "cpu": row}
+
+
+@mcp.tool()
+def cpu_ignore(cpu_id: str) -> dict[str, Any]:
+    """Ignore a CPU entry."""
+    ok = cr.ignore_cpu(cpu_id)
+    if not ok:
+        return {"ok": False, "error": f"CPU entry {cpu_id!r} not found"}
+    return {"ok": True, "cpu_id": cpu_id}
+
+
+@mcp.tool()
+def cpu_forget(cpu_id: str) -> dict[str, Any]:
+    """Remove a CPU entry so it can be re-discovered."""
+    ok = cr.clear_cpu(cpu_id)
+    if not ok:
+        return {"ok": False, "error": f"CPU entry {cpu_id!r} not found"}
+    return {"ok": True, "cpu_id": cpu_id}
 
 
 # ---------------------------------------------------------------------------
@@ -330,9 +476,12 @@ def debug_session_start(
     This is the preferred entrypoint for model-driven flows where the server
     should own sequencing and safety policy.
     """
+    resolved_serial = _resolve_approved_stlink_serial(serial)
+    target_info = stlink.chip_info(resolved_serial)
+    _register_and_require_stm32_cpu(target_info, resolved_serial)
     return wf.start_session(
         target_kind=target_kind,
-        serial=serial,
+        serial=resolved_serial,
         response_mode=response_mode,
         deep_debug=deep_debug,
     )
@@ -505,13 +654,17 @@ def stlink_flash(
 
     Returns status string on success.
     """
-    return stlink.flash_write(firmware, address=address, serial=serial, reset=reset)
+    resolved_serial = _resolve_approved_stlink_serial(serial)
+    _register_and_require_stm32_cpu(stlink.chip_info(resolved_serial), resolved_serial)
+    return stlink.flash_write(firmware, address=address, serial=resolved_serial, reset=reset)
 
 
 @mcp.tool()
 def stlink_erase(serial: Optional[str] = None) -> str:
     """Mass-erase the target flash using st-flash."""
-    return stlink.flash_erase(serial)
+    resolved_serial = _resolve_approved_stlink_serial(serial)
+    _register_and_require_stm32_cpu(stlink.chip_info(resolved_serial), resolved_serial)
+    return stlink.flash_erase(resolved_serial)
 
 
 @mcp.tool()
@@ -530,7 +683,9 @@ def stlink_read(
         length:      Number of bytes.
         serial:      ST-Link serial (optional).
     """
-    return stlink.flash_read(output_path, address, length, serial)
+    resolved_serial = _resolve_approved_stlink_serial(serial)
+    _register_and_require_stm32_cpu(stlink.chip_info(resolved_serial), resolved_serial)
+    return stlink.flash_read(output_path, address, length, resolved_serial)
 
 
 @mcp.tool()
@@ -552,9 +707,11 @@ def stlink_memory_snapshot(
     starting at ram_address and does not automatically include extra SRAM banks
     or external SPI/QSPI RAM.
     """
+    resolved_serial = _resolve_approved_stlink_serial(serial)
+    _register_and_require_stm32_cpu(stlink.chip_info(resolved_serial), resolved_serial)
     return stlink.dump_memory_snapshot(
         output_dir=output_dir,
-        serial=serial,
+        serial=resolved_serial,
         flash_address=flash_address,
         flash_length=flash_length,
         ram_address=ram_address,
@@ -567,13 +724,17 @@ def stlink_memory_snapshot(
 @mcp.tool()
 def stlink_verify(firmware: str, serial: Optional[str] = None) -> str:
     """Verify flash contents against a firmware file using st-flash."""
-    return stlink.flash_verify(firmware, serial)
+    resolved_serial = _resolve_approved_stlink_serial(serial)
+    _register_and_require_stm32_cpu(stlink.chip_info(resolved_serial), resolved_serial)
+    return stlink.flash_verify(firmware, resolved_serial)
 
 
 @mcp.tool()
 def stlink_reset(serial: Optional[str] = None) -> str:
     """Reset the target MCU via ST-Link."""
-    return stlink.reset_target(serial)
+    resolved_serial = _resolve_approved_stlink_serial(serial)
+    _register_and_require_stm32_cpu(stlink.chip_info(resolved_serial), resolved_serial)
+    return stlink.reset_target(resolved_serial)
 
 
 @mcp.tool()
@@ -588,7 +749,9 @@ def stlink_gdb_start(port: int = 4242, serial: Optional[str] = None) -> dict[str
     Returns: {handle_id, port, pid, tag} — pass handle_id to stlink_gdb_stop().
     After starting, call gdb_connect(port=PORT) to connect the GDB client.
     """
-    handle = stlink.gdb_server_start(port=port, serial=serial)
+    resolved_serial = _resolve_approved_stlink_serial(serial)
+    _register_and_require_stm32_cpu(stlink.chip_info(resolved_serial), resolved_serial)
+    handle = stlink.gdb_server_start(port=port, serial=resolved_serial)
     return handle.as_dict()
 
 
@@ -607,7 +770,9 @@ def stlink_trace_start(freq: int = 4000000, serial: Optional[str] = None) -> dic
         freq:   SWO clock frequency in Hz (default 4 MHz).
         serial: ST-Link serial (optional).
     """
-    handle = stlink.trace_start(freq=freq, serial=serial)
+    resolved_serial = _resolve_approved_stlink_serial(serial)
+    _register_and_require_stm32_cpu(stlink.chip_info(resolved_serial), resolved_serial)
+    handle = stlink.trace_start(freq=freq, serial=resolved_serial)
     return handle.as_dict()
 
 
@@ -639,37 +804,50 @@ def cube_flash(
         verify:   Verify flash after write (default True).
         reset:    Hard-reset target after flash (default True).
     """
-    return cube.flash_write(firmware, serial=serial, verify=verify, reset=reset)
+    resolved_serial = _resolve_approved_stlink_serial(serial)
+    _register_and_require_stm32_cpu(cube.probe_info(resolved_serial), resolved_serial)
+    return cube.flash_write(firmware, serial=resolved_serial, verify=verify, reset=reset)
 
 
 @mcp.tool()
 def cube_erase(serial: Optional[str] = None) -> str:
     """Mass-erase target flash via STM32CubeProgrammer."""
-    return cube.flash_erase(serial)
+    resolved_serial = _resolve_approved_stlink_serial(serial)
+    _register_and_require_stm32_cpu(cube.probe_info(resolved_serial), resolved_serial)
+    return cube.flash_erase(resolved_serial)
 
 
 @mcp.tool()
 def cube_info(serial: Optional[str] = None) -> dict[str, Any]:
     """Read target device info via STM32CubeProgrammer (device_id, flash size, UID, etc.)."""
-    return cube.probe_info(serial)
+    resolved_serial = _resolve_approved_stlink_serial(serial)
+    info = cube.probe_info(resolved_serial)
+    _register_and_require_stm32_cpu(info, resolved_serial)
+    return info
 
 
 @mcp.tool()
 def cube_read_uid(serial: Optional[str] = None) -> str:
     """Read the 96-bit STM32 unique device ID via CubeProgrammer."""
-    return cube.read_uid(serial)
+    resolved_serial = _resolve_approved_stlink_serial(serial)
+    _register_and_require_stm32_cpu(cube.probe_info(resolved_serial), resolved_serial)
+    return cube.read_uid(resolved_serial)
 
 
 @mcp.tool()
 def cube_otp_read(serial: Optional[str] = None) -> str:
     """Read option bytes / OTP area via CubeProgrammer."""
-    return cube.read_otp(serial)
+    resolved_serial = _resolve_approved_stlink_serial(serial)
+    _register_and_require_stm32_cpu(cube.probe_info(resolved_serial), resolved_serial)
+    return cube.read_otp(resolved_serial)
 
 
 @mcp.tool()
 def cube_otp_dump(output_path: str, serial: Optional[str] = None) -> dict[str, Any]:
     """Read option bytes / OTP text via CubeProgrammer and save it to a file."""
-    return cube.dump_otp(output_path, serial)
+    resolved_serial = _resolve_approved_stlink_serial(serial)
+    _register_and_require_stm32_cpu(cube.probe_info(resolved_serial), resolved_serial)
+    return cube.dump_otp(output_path, resolved_serial)
 
 
 @mcp.tool()
@@ -683,7 +861,9 @@ def cube_connection_properties(
 
     Use under_reset=True to inspect the connect-under-reset profile.
     """
-    return cube.connection_properties(serial=serial, freq=freq, under_reset=under_reset)
+    resolved_serial = _resolve_approved_stlink_serial(serial)
+    _register_and_require_stm32_cpu(cube.probe_info(resolved_serial), resolved_serial)
+    return cube.connection_properties(serial=resolved_serial, freq=freq, under_reset=under_reset)
 
 
 @mcp.tool()
@@ -693,7 +873,9 @@ def cube_recover(serial: Optional[str] = None) -> str:
 
     Use when the target is locked or unresponsive to normal connection.
     """
-    return cube.recover(serial)
+    resolved_serial = _resolve_approved_stlink_serial(serial)
+    _register_and_require_stm32_cpu(cube.probe_info(resolved_serial), resolved_serial)
+    return cube.recover(resolved_serial)
 
 
 @mcp.tool()
@@ -712,7 +894,9 @@ def cube_read_flash(
         length:      Number of bytes.
         serial:      ST-Link serial (optional).
     """
-    return cube.flash_read(output_path, address, length, serial)
+    resolved_serial = _resolve_approved_stlink_serial(serial)
+    _register_and_require_stm32_cpu(cube.probe_info(resolved_serial), resolved_serial)
+    return cube.flash_read(output_path, address, length, resolved_serial)
 
 
 @mcp.tool()
@@ -732,7 +916,9 @@ def cube_gdb_start(
     Returns: {handle_id, port, pid, tag} — pass handle_id to cube_gdb_stop().
     After starting, call gdb_connect(port=PORT) to connect the GDB client.
     """
-    handle = cube.gdb_server_start(port=port, serial=serial, freq=freq)
+    resolved_serial = _resolve_approved_stlink_serial(serial)
+    _register_and_require_stm32_cpu(cube.probe_info(resolved_serial), resolved_serial)
+    handle = cube.gdb_server_start(port=port, serial=resolved_serial, freq=freq)
     return handle.as_dict()
 
 
@@ -896,13 +1082,19 @@ def esp_chip_info(port: Optional[str] = None, baud: int = 460800) -> dict[str, A
         port: Serial port (e.g. '/dev/ttyUSB0'). Auto-detect if omitted.
         baud: Baud rate for esptool connection (default 460800).
     """
-    return esp.chip_info(port=port, baud=baud)
+    resolved_port = _resolve_approved_esp_port(port)
+    info = esp.chip_info(port=resolved_port, baud=baud)
+    _register_and_require_esp_cpu(info, resolved_port)
+    return info
 
 
 @mcp.tool()
 def esp_flash_id(port: Optional[str] = None) -> dict[str, Any]:
     """Read ESP flash manufacturer and size information."""
-    return esp.flash_id(port=port)
+    resolved_port = _resolve_approved_esp_port(port)
+    info = esp.chip_info(port=resolved_port, baud=460800)
+    _register_and_require_esp_cpu(info, resolved_port)
+    return esp.flash_id(port=resolved_port)
 
 
 @mcp.tool()
@@ -923,13 +1115,19 @@ def esp_flash_write(
         offset:   Flash offset (default '0x0').
         chip:     Chip override (e.g. 'esp32', 'esp32s3'). Auto-detect if omitted.
     """
-    return esp.flash_write(firmware, port=port, baud=baud, offset=offset, chip=chip)
+    resolved_port = _resolve_approved_esp_port(port)
+    info = esp.chip_info(port=resolved_port, baud=baud)
+    _register_and_require_esp_cpu(info, resolved_port)
+    return esp.flash_write(firmware, port=resolved_port, baud=baud, offset=offset, chip=chip)
 
 
 @mcp.tool()
 def esp_flash_erase(port: Optional[str] = None, chip: Optional[str] = None) -> str:
     """Erase entire ESP flash chip."""
-    return esp.flash_erase(port=port, chip=chip)
+    resolved_port = _resolve_approved_esp_port(port)
+    info = esp.chip_info(port=resolved_port, baud=460800)
+    _register_and_require_esp_cpu(info, resolved_port)
+    return esp.flash_erase(port=resolved_port, chip=chip)
 
 
 @mcp.tool()
@@ -948,7 +1146,10 @@ def esp_flash_read(
         length:      Bytes to read (default 4 MB).
         port:        Serial port (auto-detect if omitted).
     """
-    return esp.flash_read(output_path, offset=offset, length=length, port=port)
+    resolved_port = _resolve_approved_esp_port(port)
+    info = esp.chip_info(port=resolved_port, baud=460800)
+    _register_and_require_esp_cpu(info, resolved_port)
+    return esp.flash_read(output_path, offset=offset, length=length, port=resolved_port)
 
 
 @mcp.tool()
@@ -960,7 +1161,10 @@ def esp_reset(port: Optional[str] = None, mode: str = "normal") -> str:
         port: Serial port (auto-detect if omitted).
         mode: 'normal' (run firmware) or 'bootloader' (enter download mode).
     """
-    return esp.reset_chip(port=port, mode=mode)
+    resolved_port = _resolve_approved_esp_port(port)
+    info = esp.chip_info(port=resolved_port, baud=460800)
+    _register_and_require_esp_cpu(info, resolved_port)
+    return esp.reset_chip(port=resolved_port, mode=mode)
 
 
 # ---------------------------------------------------------------------------
@@ -992,7 +1196,10 @@ def idf_flash(
         port:         Serial port (auto-detect if omitted).
         baud:         Flash baud rate (default 460800).
     """
-    return esp.idf_flash(project_path=project_path, port=port, baud=baud)
+    resolved_port = _resolve_approved_esp_port(port)
+    info = esp.chip_info(port=resolved_port, baud=baud)
+    _register_and_require_esp_cpu(info, resolved_port)
+    return esp.idf_flash(project_path=project_path, port=resolved_port, baud=baud)
 
 
 @mcp.tool()
@@ -1017,7 +1224,10 @@ def idf_monitor_start(
 
     Returns: {handle_id, ...} — pass handle_id to idf_monitor_stop().
     """
-    handle = esp.idf_monitor_start(project_path=project_path, port=port, baud=baud)
+    resolved_port = _resolve_approved_esp_port(port)
+    info = esp.chip_info(port=resolved_port, baud=baud)
+    _register_and_require_esp_cpu(info, resolved_port)
+    handle = esp.idf_monitor_start(project_path=project_path, port=resolved_port, baud=baud)
     return handle.as_dict()
 
 
@@ -1069,6 +1279,11 @@ def _parse_args() -> argparse.Namespace:
         help="Path to probe registry file (default: probes.json in cwd)",
     )
     p.add_argument(
+        "--cpu-registry",
+        default="cpus.json",
+        help="Path to CPU registry file (default: cpus.json in cwd)",
+    )
+    p.add_argument(
         "--verbose", "-v",
         action="store_true",
         help="Enable DEBUG-level logging",
@@ -1087,13 +1302,18 @@ def main() -> None:
 
     # Configure probe registry path
     pd.configure_registry(args.registry)
+    cr.configure_registry(args.cpu_registry)
 
     # Start probe monitor unless disabled
     if not args.no_monitor:
         monitor = pd.get_monitor()
         monitor.on_connect(_on_probe_connect)
         monitor.on_disconnect(_on_probe_disconnect)
-        log.info("Probe monitor started — registry: %s", args.registry)
+        log.info(
+            "Probe monitor started — probe registry: %s, cpu registry: %s",
+            args.registry,
+            args.cpu_registry,
+        )
 
     log.info("awto-debug-embedded MCP server starting")
 
