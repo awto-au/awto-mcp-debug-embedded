@@ -52,26 +52,47 @@ from gdb_client import get_client as _gdb
 from process_manager import get_manager as _mgr
 
 # ---------------------------------------------------------------------------
-# Logging  (colorlog stderr + syslog)
+# Logging  (colorlog stderr + platform-specific file/syslog handler)
 # ---------------------------------------------------------------------------
 
 def _setup_logging(verbose: bool = False) -> None:
     root = logging.getLogger()
     root.setLevel(logging.DEBUG if verbose else logging.INFO)
 
-    try:
-        syslog = logging.handlers.SysLogHandler(
-            address="/dev/log",
-            facility=logging.handlers.SysLogHandler.LOG_USER,
-        )
-        if getattr(syslog, "socket", None) is not None:
-            syslog.ident = "awto-debug-embedded: "
-            syslog.setFormatter(logging.Formatter("%(levelname)s %(name)s: %(message)s"))
-            root.addHandler(syslog)
-        else:
-            syslog.close()
-    except OSError:
-        pass
+    if sys.platform == "linux":
+        # Linux: log to syslog via /dev/log
+        try:
+            syslog = logging.handlers.SysLogHandler(
+                address="/dev/log",
+                facility=logging.handlers.SysLogHandler.LOG_USER,
+            )
+            if getattr(syslog, "socket", None) is not None:
+                syslog.ident = "awto-debug-embedded: "
+                syslog.setFormatter(logging.Formatter("%(levelname)s %(name)s: %(message)s"))
+                root.addHandler(syslog)
+            else:
+                syslog.close()
+        except OSError:
+            pass
+    else:
+        # macOS / Windows: rotate log file in user data dir
+        import tempfile
+        log_dir = Path(tempfile.gettempdir()) / "awto-mcp-debug-embedded"
+        try:
+            log_dir.mkdir(parents=True, exist_ok=True)
+            fh = logging.handlers.RotatingFileHandler(
+                log_dir / "server.log",
+                maxBytes=2 * 1024 * 1024,  # 2 MB
+                backupCount=3,
+                encoding="utf-8",
+            )
+            fh.setFormatter(logging.Formatter(
+                "%(asctime)s %(levelname)-8s %(name)s: %(message)s",
+                datefmt="%Y-%m-%dT%H:%M:%S",
+            ))
+            root.addHandler(fh)
+        except OSError:
+            pass
 
     handler = colorlog.StreamHandler(sys.stderr)
     handler.setFormatter(colorlog.ColoredFormatter(

@@ -23,6 +23,7 @@ requires-python = ">=3.13"
 dependencies = [
     "mcp[cli]",
     "pyusb>=1.2",
+    "libusb-package",
     "pyserial>=3.5",
     "colorlog",
 ]
