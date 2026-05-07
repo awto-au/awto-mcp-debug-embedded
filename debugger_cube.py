@@ -241,6 +241,41 @@ def read_otp(serial: Optional[str] = None) -> str:
     return combined
 
 
+def dump_otp(output_path: str, serial: Optional[str] = None) -> dict[str, Any]:
+    """Read option bytes / OTP text and save it to a file."""
+    text = read_otp(serial)
+    path = Path(output_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text + ("" if text.endswith("\n") else "\n"))
+    return {
+        "output_path": str(path),
+        "bytes_written": path.stat().st_size,
+    }
+
+
+def connection_properties(
+    serial: Optional[str] = None,
+    freq: int = 8000,
+    under_reset: bool = False,
+) -> dict[str, Any]:
+    """Return the CubeProgrammer connection arguments that would be used."""
+    connect_args = _connect_under_reset_args(serial, freq=freq) if under_reset else _connect_args(
+        serial,
+        freq=freq,
+    )
+    return {
+        "backend": shutil.which("cube") and "cube" or shutil.which("STM32_Programmer_CLI") and "STM32_Programmer_CLI" or None,
+        "serial": serial,
+        "freq_khz": freq,
+        "under_reset": under_reset,
+        "connect_args": connect_args,
+        "notes": [
+            "under_reset=true uses mode=UR for a connect-under-reset session.",
+            "Normal connections use port=SWD and the requested SWD clock frequency.",
+        ],
+    }
+
+
 def recover(serial: Optional[str] = None) -> str:
     """
     Attempt full-chip recovery: connect-under-reset then mass erase.

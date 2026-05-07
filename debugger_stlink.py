@@ -12,15 +12,40 @@ st-trace — SWO trace capture
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import subprocess
 import shutil
+from pathlib import Path
 from typing import Any, Optional
 
 from process_manager import ProcessHandle, get_manager
 
 log = logging.getLogger("awto.stlink")
+
+FLASH_BASE_DEFAULT = "0x08000000"
+SRAM_BASE_DEFAULT = "0x20000000"
+
+# Cache known target metadata keyed by ST-Link serial. This lets serial-targeted
+# operations avoid re-running probe scans unless a required field is missing.
+_TARGET_INFO_CACHE: dict[str, dict[str, Any]] = {}
+
+
+def _normalize_probe_info(probe: dict[str, Any]) -> dict[str, Any]:
+    info: dict[str, Any] = {
+        "chip_id": probe.get("chip_id"),
+        "device_name": probe.get("device_name"),
+    }
+    if "flash_size_bytes" in probe:
+        info["flash_size_kb"] = int(probe["flash_size_bytes"]) // 1024
+    if "ram_size_bytes" in probe:
+        info["ram_size_kb"] = int(probe["ram_size_bytes"]) // 1024
+    if "firmware" in probe:
+        info["firmware"] = probe["firmware"]
+    if "voltage" in probe:
+        info["voltage"] = probe["voltage"]
+    return {key: value for key, value in info.items() if value is not None}
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -71,7 +96,8 @@ def probe_list() -> list[dict[str, Any]]:
     """
     Return list of attached ST-Link probes from st-info --probe.
 
-    Each dict: {serial, hla_serial, firmware, voltage, target_id, target_description}
+    Each dict: {serial, firmware, voltage, chip_id, flash_size_bytes,
+    ram_size_bytes, device_name}
     Returns empty list if no probes found (not an error).
     """
     _require("st-info")
@@ -109,9 +135,20 @@ def probe_list() -> list[dict[str, Any]]:
             current["target_description"] = m.group(1).strip()
         elif m := re.match(r"chipid:\s+(\S+)", line):
             current["chip_id"] = m.group(1)
+        elif m := re.match(r"flash:\s+(\d+)", line):
+            current["flash_size_bytes"] = int(m.group(1))
+        elif m := re.match(r"sram:\s+(\d+)", line):
+            current["ram_size_bytes"] = int(m.group(1))
+        elif m := re.match(r"dev-type:\s+(.+)", line):
+            current["device_name"] = m.group(1).strip()
 
     if current:
         probes.append(current)
+
+    for probe in probes:
+        serial = probe.get("serial")
+        if serial:
+            _TARGET_INFO_CACHE[serial] = _normalize_probe_info(probe)
 
     return probes
 
@@ -123,37 +160,124 @@ def chip_info(serial: Optional[str] = None) -> dict[str, Any]:
     Args:
         serial: ST-Link serial (optional if only one probe is attached).
 
-    Returns dict with: chip_id, flash_size_kb, ram_size_kb, device_name, description
+    Returns dict with: chip_id, flash_size_kb, ram_size_kb, device_name, firmware, voltage
     """
-    _require("st-info")
-    cmd = ["st-info", "--chipid"]
+    if serial and serial in _TARGET_INFO_CACHE:
+        return dict(_TARGET_INFO_CACHE[serial])
+
+    if serial is None and len(_TARGET_INFO_CACHE) == 1:
+        return dict(next(iter(_TARGET_INFO_CACHE.values())))
+
+    probes = probe_list()
     if serial:
-        cmd += ["--serial", serial]
-    _, stdout, stderr = _run(cmd)
-    combined = stdout + stderr
+        matches = [probe for probe in probes if probe.get("serial") == serial]
+        if not matches:
+            raise RuntimeError(f"No ST-Link probe matched serial {serial!r}.")
+        probe = matches[0]
+    else:
+        if not probes:
+            raise RuntimeError("Could not read chip info — no ST-Link probes detected.")
+        if len(probes) > 1:
+            raise RuntimeError("Multiple ST-Link probes detected; specify serial.")
+        probe = probes[0]
 
-    info: dict[str, Any] = {}
-
-    if m := re.search(r"chipid:\s+(0x[0-9a-fA-F]+)", combined):
-        info["chip_id"] = m.group(1)
-    if m := re.search(r"flash_size:\s+(\d+)", combined):
-        info["flash_size_kb"] = int(m.group(1))
-    if m := re.search(r"sram_size:\s+(\d+)", combined):
-        info["ram_size_kb"] = int(m.group(1))
-    if m := re.search(r"description:\s+(.+)", combined):
-        info["description"] = m.group(1).strip()
-
-    # Also try --descr
-    cmd2 = ["st-info", "--descr"]
+    info = _normalize_probe_info(probe)
     if serial:
-        cmd2 += ["--serial", serial]
-    _, stdout2, _ = _run(cmd2)
-    if stdout2.strip():
-        info["device_name"] = stdout2.strip()
-
-    if not info:
-        raise RuntimeError(f"Could not read chip info — is a target connected? Output: {combined[:200]}")
+        _TARGET_INFO_CACHE[serial] = dict(info)
     return info
+
+
+def dump_memory_snapshot(
+    output_dir: str,
+    serial: Optional[str] = None,
+    flash_address: str = FLASH_BASE_DEFAULT,
+    flash_length: Optional[int] = None,
+    ram_address: str = SRAM_BASE_DEFAULT,
+    ram_length: Optional[int] = None,
+    include_flash: bool = True,
+    include_ram: bool = True,
+) -> dict[str, Any]:
+    """
+    Dump a target memory snapshot to files using st-flash.
+
+    This covers one contiguous internal flash range and one contiguous SRAM
+    range. It does not discover extra SRAM banks or external SPI/QSPI RAM.
+    """
+    if not include_flash and not include_ram:
+        raise RuntimeError("Nothing to dump: enable include_flash and/or include_ram.")
+
+    need_flash_size = include_flash and flash_length is None
+    need_ram_size = include_ram and ram_length is None
+
+    probe: dict[str, Any] = {}
+    if serial and serial in _TARGET_INFO_CACHE:
+        probe = dict(_TARGET_INFO_CACHE[serial])
+
+    if need_flash_size or need_ram_size:
+        # A scan is only needed when caller did not provide explicit lengths.
+        probe = chip_info(serial)
+    elif not probe and serial:
+        probe = {"serial": serial}
+    elif not probe and serial is None:
+        probe = chip_info(serial)
+    output_root = Path(output_dir)
+    output_root.mkdir(parents=True, exist_ok=True)
+
+    files: dict[str, str] = {}
+    notes = [
+        "RAM dump covers a single contiguous region starting at ram_address.",
+        "External SPI/QSPI RAM is not included unless explicitly mapped into that range.",
+    ]
+
+    inferred_flash_length = flash_length
+    if include_flash and inferred_flash_length is None:
+        flash_kb = probe.get("flash_size_kb")
+        if not flash_kb:
+            raise RuntimeError("Could not infer flash size; pass flash_length explicitly.")
+        inferred_flash_length = int(flash_kb) * 1024
+
+    inferred_ram_length = ram_length
+    if include_ram and inferred_ram_length is None:
+        ram_kb = probe.get("ram_size_kb")
+        if not ram_kb:
+            raise RuntimeError("Could not infer RAM size; pass ram_length explicitly.")
+        inferred_ram_length = int(ram_kb) * 1024
+
+    if include_flash and inferred_flash_length:
+        flash_path = output_root / "flash.bin"
+        flash_read(str(flash_path), flash_address, inferred_flash_length, serial)
+        files["flash"] = str(flash_path)
+
+    if include_ram and inferred_ram_length:
+        ram_path = output_root / "ram.bin"
+        flash_read(str(ram_path), ram_address, inferred_ram_length, serial)
+        files["ram"] = str(ram_path)
+
+    metadata = {
+        "serial": serial,
+        "chip_info": probe,
+        "flash_address": flash_address if include_flash else None,
+        "flash_length": inferred_flash_length if include_flash else None,
+        "ram_address": ram_address if include_ram else None,
+        "ram_length": inferred_ram_length if include_ram else None,
+        "files": files,
+        "notes": notes,
+    }
+    metadata_path = output_root / "metadata.json"
+    metadata_path.write_text(json.dumps(metadata, indent=2) + "\n")
+    files["metadata"] = str(metadata_path)
+
+    result = {
+        "output_dir": str(output_root),
+        "files": files,
+        "chip_info": probe,
+        "notes": notes,
+    }
+    if include_flash:
+        result["flash_length"] = inferred_flash_length
+    if include_ram:
+        result["ram_length"] = inferred_ram_length
+    return result
 
 
 # ---------------------------------------------------------------------------

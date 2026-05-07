@@ -265,6 +265,93 @@ class TestProcessManager(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# TestStlinkHelpers — parser and snapshot helpers without hardware
+# ---------------------------------------------------------------------------
+
+class TestStlinkHelpers(unittest.TestCase):
+    """Tests for debugger_stlink helpers with mocked subprocess/file IO."""
+
+    def setUp(self) -> None:
+        import debugger_stlink as st
+        self.st = st
+        self.st._TARGET_INFO_CACHE.clear()
+
+    def test_probe_list_parses_flash_ram_and_device(self) -> None:
+        sample = """
+Found 1 stlink programmers
+  version:    V3J13
+  serial:     003400223137510E33333639
+  flash:      131072 (pagesize: 131072)
+  sram:       131072
+  chipid:     0x450
+  dev-type:   STM32H74x_H75x
+""".strip()
+        with patch.object(self.st, "_run", return_value=(0, sample, "")):
+            probes = self.st.probe_list()
+        self.assertEqual(len(probes), 1)
+        self.assertEqual(probes[0]["serial"], "003400223137510E33333639")
+        self.assertEqual(probes[0]["flash_size_bytes"], 131072)
+        self.assertEqual(probes[0]["ram_size_bytes"], 131072)
+        self.assertEqual(probes[0]["device_name"], "STM32H74x_H75x")
+
+    def test_chip_info_requires_serial_when_multiple_probes_present(self) -> None:
+        probes = [
+            {"serial": "AAA", "chip_id": "0x111"},
+            {"serial": "BBB", "chip_id": "0x222"},
+        ]
+        with patch.object(self.st, "probe_list", return_value=probes):
+            with self.assertRaises(RuntimeError):
+                self.st.chip_info()
+
+    def test_chip_info_uses_cache_without_probe_scan(self) -> None:
+        self.st._TARGET_INFO_CACHE["SERIAL1"] = {
+            "chip_id": "0x450",
+            "device_name": "STM32H74x_H75x",
+            "flash_size_kb": 128,
+            "ram_size_kb": 128,
+        }
+        with patch.object(self.st, "probe_list", side_effect=AssertionError("should not scan")):
+            info = self.st.chip_info("SERIAL1")
+        self.assertEqual(info["chip_id"], "0x450")
+
+    def test_dump_memory_snapshot_writes_metadata_and_calls_reads(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.object(self.st, "chip_info", return_value={
+                "chip_id": "0x450",
+                "device_name": "STM32H74x_H75x",
+                "flash_size_kb": 128,
+                "ram_size_kb": 128,
+            }):
+                with patch.object(self.st, "flash_read") as mock_read:
+                    result = self.st.dump_memory_snapshot(
+                        tmpdir,
+                        serial="SERIAL1",
+                    )
+                    self.assertIn("metadata", result["files"])
+                    self.assertEqual(mock_read.call_args_list, [
+                        call(str(Path(tmpdir) / "flash.bin"), "0x08000000", 131072, "SERIAL1"),
+                        call(str(Path(tmpdir) / "ram.bin"), "0x20000000", 131072, "SERIAL1"),
+                    ])
+                    metadata = json.loads(Path(result["files"]["metadata"]).read_text())
+                    self.assertEqual(metadata["chip_info"]["chip_id"], "0x450")
+                    self.assertEqual(metadata["flash_length"], 131072)
+                    self.assertEqual(metadata["ram_length"], 131072)
+
+    def test_dump_memory_snapshot_with_explicit_lengths_skips_chip_info(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.object(self.st, "chip_info", side_effect=AssertionError("should not scan")):
+                with patch.object(self.st, "flash_read") as mock_read:
+                    result = self.st.dump_memory_snapshot(
+                        tmpdir,
+                        serial="SERIAL2",
+                        flash_length=64,
+                        ram_length=64,
+                    )
+        self.assertEqual(mock_read.call_count, 2)
+        self.assertEqual(result["chip_info"]["serial"], "SERIAL2")
+
+
+# ---------------------------------------------------------------------------
 # TestMiParser — GDB/MI response parsing (pure unit, no socket)
 # ---------------------------------------------------------------------------
 

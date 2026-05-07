@@ -52,11 +52,13 @@ Add to your workspace `.vscode/mcp.json` (already present):
 
 ### ST-Link open-source (st-flash / st-info / st-util)
 `stlink_flash`, `stlink_erase`, `stlink_read`, `stlink_verify`, `stlink_reset`,
-`stlink_gdb_start`, `stlink_gdb_stop`, `stlink_trace_start`, `stlink_trace_stop`
+`stlink_memory_snapshot`, `stlink_gdb_start`, `stlink_gdb_stop`,
+`stlink_trace_start`, `stlink_trace_stop`
 
 ### STM32CubeProgrammer
 `cube_flash`, `cube_erase`, `cube_info`, `cube_read_uid`, `cube_otp_read`,
-`cube_recover`, `cube_gdb_start`, `cube_gdb_stop`
+`cube_otp_dump`, `cube_connection_properties`, `cube_recover`,
+`cube_gdb_start`, `cube_gdb_stop`
 
 ### GDB client (GDB/MI over TCP)
 `gdb_connect`, `gdb_disconnect`, `gdb_read_memory`, `gdb_read_registers`,

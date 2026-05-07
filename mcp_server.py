@@ -362,6 +362,37 @@ def stlink_read(
 
 
 @mcp.tool()
+def stlink_memory_snapshot(
+    output_dir: str,
+    serial: Optional[str] = None,
+    flash_address: str = "0x08000000",
+    flash_length: Optional[int] = None,
+    ram_address: str = "0x20000000",
+    ram_length: Optional[int] = None,
+    include_flash: bool = True,
+    include_ram: bool = True,
+) -> dict[str, Any]:
+    """
+    Dump one contiguous internal flash range and one contiguous RAM range to files.
+
+    If flash_length / ram_length are omitted, the tool infers the sizes from
+    st-info --probe for the selected target. RAM capture defaults to one range
+    starting at ram_address and does not automatically include extra SRAM banks
+    or external SPI/QSPI RAM.
+    """
+    return stlink.dump_memory_snapshot(
+        output_dir=output_dir,
+        serial=serial,
+        flash_address=flash_address,
+        flash_length=flash_length,
+        ram_address=ram_address,
+        ram_length=ram_length,
+        include_flash=include_flash,
+        include_ram=include_ram,
+    )
+
+
+@mcp.tool()
 def stlink_verify(firmware: str, serial: Optional[str] = None) -> str:
     """Verify flash contents against a firmware file using st-flash."""
     return stlink.flash_verify(firmware, serial)
@@ -461,6 +492,26 @@ def cube_read_uid(serial: Optional[str] = None) -> str:
 def cube_otp_read(serial: Optional[str] = None) -> str:
     """Read option bytes / OTP area via CubeProgrammer."""
     return cube.read_otp(serial)
+
+
+@mcp.tool()
+def cube_otp_dump(output_path: str, serial: Optional[str] = None) -> dict[str, Any]:
+    """Read option bytes / OTP text via CubeProgrammer and save it to a file."""
+    return cube.dump_otp(output_path, serial)
+
+
+@mcp.tool()
+def cube_connection_properties(
+    serial: Optional[str] = None,
+    freq: int = 8000,
+    under_reset: bool = False,
+) -> dict[str, Any]:
+    """
+    Show the CubeProgrammer connection arguments for this target.
+
+    Use under_reset=True to inspect the connect-under-reset profile.
+    """
+    return cube.connection_properties(serial=serial, freq=freq, under_reset=under_reset)
 
 
 @mcp.tool()
