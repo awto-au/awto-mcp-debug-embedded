@@ -411,6 +411,113 @@ def probe_info(serial: Optional[str] = None) -> dict[str, Any]:
     )
 
 
+@mcp.tool()
+def system_permissions_check() -> dict[str, Any]:
+    """
+    Diagnose USB access permissions for ST-Link debug probes.
+
+    Checks udev rules, group membership (plugdev/dialout), and direct
+    /dev/bus/usb read access. Returns actionable fix instructions if
+    any issues are found.
+
+    Run this if probe_list() returns no connected probes despite devices
+    being physically attached, or if st-info / st-flash report libusb
+    error -3 (ACCESS) or -4.
+
+    The standard fix on Linux:
+      1. Install udev rules (stlink project or awto installer)
+      2. Add user to the plugdev group
+      3. Replug devices
+
+    Upstream rules:
+      https://github.com/stlink-org/stlink/tree/master/config/udev/rules.d
+    """
+    from dataclasses import asdict as _asdict
+    perms = pd.check_usb_permissions()
+    return _asdict(perms)
+
+
+@mcp.tool()
+def probe_scan_all() -> dict[str, Any]:
+    """
+    Perform a full scan: enumerate all connected USB probes and cross-reference
+    with the registry and CPU registry.
+
+    Unlike probe_list() (which returns registry state), this does a live USB
+    scan via sysfs (no device-open permission needed) so real serial numbers
+    are always resolved correctly.
+
+    Returns:
+        connected:   list of currently attached probes with registry state
+        registry:    all probes ever seen (including disconnected)
+        cpus:        all registered CPUs
+        backends:    available CLI tools
+        permissions: USB permission health summary
+    """
+    from dataclasses import asdict as _asdict
+
+    # Live USB scan — uses sysfs so no special perms needed for serial resolution
+    live_probes = pd.enumerate_all_probes()
+    live_by_serial = {p.serial: p for p in live_probes}
+
+    # Registry (all ever-seen probes)
+    registry_probes = pd.get_all_probes()
+    registry_by_serial = {p.serial: p for p in registry_probes}
+
+    # Merge: annotate live probes with registry state/nick
+    connected_out: list[dict[str, Any]] = []
+    for serial, live in live_by_serial.items():
+        entry = _asdict(live)
+        if serial in registry_by_serial:
+            reg = registry_by_serial[serial]
+            entry["state"] = reg.state
+            entry["nick"] = reg.nick
+        entry["connected"] = True
+        connected_out.append(entry)
+
+    # Annotate registry probes with connected status
+    registry_out: list[dict[str, Any]] = []
+    for p in registry_probes:
+        entry = _asdict(p)
+        entry["connected"] = p.serial in live_by_serial
+        registry_out.append(entry)
+
+    # CPU registry
+    cpus = cr.get_all_cpus()
+
+    # Quick permission health (no device open)
+    perms = pd.check_usb_permissions()
+    perm_summary = {
+        "ok": perms.ok,
+        "in_plugdev": perms.in_plugdev,
+        "udev_rules_count": len(perms.udev_rules_files),
+        "blocked_devices": perms.stlink_devices_blocked,
+        "issues": perms.issues,
+    }
+
+    result: dict[str, Any] = {
+        "connected": connected_out,
+        "registry": registry_out,
+        "cpus": cpus,
+        "backends": _asdict(pd.check_backends()),
+        "permissions": perm_summary,
+    }
+
+    pending_probes = [p["serial"] for p in registry_out if p.get("state") == "pending"]
+    if pending_probes:
+        result["message"] = (
+            f"{len(pending_probes)} probe(s) await approval — "
+            "call probe_approve(serial, nick) or probe_ignore(serial) for each."
+        )
+    if not perms.ok:
+        result.setdefault("message", "")
+        result["message"] += (
+            " USB permission issues detected — call system_permissions_check() for details."
+        )
+
+    return result
+
+
 # ---------------------------------------------------------------------------
 # ── CPU registry tools ─────────────────────────────────────────────────────
 # ---------------------------------------------------------------------------
@@ -1316,6 +1423,16 @@ def main() -> None:
         )
 
     log.info("awto-debug-embedded MCP server starting")
+
+    # Startup permission check — warn but don't abort
+    perms = pd.check_usb_permissions()
+    if not perms.ok:
+        for issue in perms.issues:
+            log.warning("USB permissions: %s", issue)
+        log.warning(
+            "ST-Link devices may not be accessible. "
+            "Call system_permissions_check() for a full diagnosis and fix instructions."
+        )
 
     try:
         mcp.run()

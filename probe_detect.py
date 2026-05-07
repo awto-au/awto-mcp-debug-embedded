@@ -30,8 +30,10 @@ probes.json schema:
 
 from __future__ import annotations
 
+import grp
 import json
 import logging
+import os
 import shutil
 import threading
 import time
@@ -51,11 +53,27 @@ STLINK_PID_TYPES: dict[int, str] = {
     0x3748: "ST-LINK/V2",
     0x374A: "ST-LINK/V2-1",
     0x374B: "ST-LINK/V2-1",
+    0x374D: "ST-LINK/V3 (loader)",
     0x374E: "ST-LINK/V3E",
+    0x374F: "ST-LINK/V3S",
     0x3752: "ST-LINK/V3-MNIE",
     0x3753: "ST-LINK/V3",
     0x3754: "ST-LINK/V3",
+    0x3755: "ST-LINK/V3 (loader)",
+    0x3757: "ST-LINK/V3MODS",
+    0x3762: "ST-LINK/V3-HLADAPTER",
 }
+
+# Known udev rules files that grant access to ST-Link devices
+STLINK_UDEV_RULES_PATHS = [
+    "/etc/udev/rules.d/60-awto-stlink.rules",
+    "/etc/udev/rules.d/49-stlinkv3.rules",
+    "/etc/udev/rules.d/49-stlinkv2-1.rules",
+    "/etc/udev/rules.d/49-stlinkv2.rules",
+    "/lib/udev/rules.d/60-openocd.rules",
+    "/usr/lib/udev/rules.d/60-openocd.rules",
+    "/etc/udev/rules.d/70-st-link.rules",
+]
 
 # ESP32 serial adapter VID/PID table
 ESP_ADAPTERS: dict[tuple[int, int], str] = {
@@ -218,6 +236,54 @@ def clear_probe(serial: str) -> bool:
 # Live USB enumeration
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Sysfs serial resolution — reads serial without opening the USB device
+# ---------------------------------------------------------------------------
+
+_sysfs_serial_cache: dict[tuple[int, int], str] = {}
+_sysfs_cache_lock = threading.Lock()
+
+
+def _build_sysfs_serial_map() -> dict[tuple[int, int], str]:
+    """
+    Build a (bus, devnum) → serial mapping by reading /sys/bus/usb/devices.
+    No special permissions required — serial is a sysfs attribute.
+    """
+    result: dict[tuple[int, int], str] = {}
+    try:
+        sysfs_root = Path("/sys/bus/usb/devices")
+        for entry in sysfs_root.iterdir():
+            try:
+                serial_path = entry / "serial"
+                if not serial_path.exists():
+                    continue
+                bus = int((entry / "busnum").read_text().strip())
+                dev = int((entry / "devnum").read_text().strip())
+                serial = serial_path.read_text().strip()
+                if serial:
+                    result[(bus, dev)] = serial
+            except (OSError, ValueError):
+                continue
+    except OSError:
+        pass
+    return result
+
+
+def _serial_from_sysfs(bus: int, address: int) -> str:
+    """Return USB serial number for bus:address from sysfs (no device open needed)."""
+    with _sysfs_cache_lock:
+        if not _sysfs_serial_cache:
+            _sysfs_serial_cache.update(_build_sysfs_serial_map())
+        return _sysfs_serial_cache.get((bus, address), "")
+
+
+def _refresh_sysfs_cache() -> None:
+    """Refresh the sysfs serial cache (call after USB hotplug events)."""
+    with _sysfs_cache_lock:
+        _sysfs_serial_cache.clear()
+        _sysfs_serial_cache.update(_build_sysfs_serial_map())
+
+
 def _enumerate_stlink_probes() -> list[ProbeInfo]:
     """Return list of currently-attached ST-Link probes via pyusb."""
     try:
@@ -238,6 +304,11 @@ def _enumerate_stlink_probes() -> list[ProbeInfo]:
         try:
             serial = usb.util.get_string(dev, dev.iSerialNumber) or ""
         except Exception:
+            pass
+        if not serial:
+            # Fall back to sysfs (no device-open permission needed)
+            serial = _serial_from_sysfs(dev.bus, dev.address)
+        if not serial:
             serial = f"{dev.bus:03d}:{dev.address:03d}"
         results.append(ProbeInfo(
             serial=serial,
@@ -268,6 +339,8 @@ def _enumerate_esp_adapters() -> list[ProbeInfo]:
                     serial = usb.util.get_string(dev, dev.iSerialNumber) or ""
                 except Exception:
                     pass
+                if not serial:
+                    serial = _serial_from_sysfs(dev.bus, dev.address)
                 if not serial:
                     serial = f"{dev.bus:03d}:{dev.address:03d}"
                 results.append(ProbeInfo(
@@ -321,6 +394,7 @@ def _enumerate_esp_adapters() -> list[ProbeInfo]:
 
 def enumerate_all_probes() -> list[ProbeInfo]:
     """Enumerate all currently-attached probes (ST-Link + ESP adapters)."""
+    _refresh_sysfs_cache()  # Rebuild serial map before each full scan
     return _enumerate_stlink_probes() + _enumerate_esp_adapters()
 
 
@@ -347,6 +421,145 @@ def check_backends() -> BackendStatus:
     """Return which debugger CLIs are installed on this machine."""
     def has(cmd: str) -> bool:
         return shutil.which(cmd) is not None
+
+    return BackendStatus(
+        st_flash=has("st-flash"),
+        st_info=has("st-info"),
+        st_util=has("st-util"),
+        st_trace=has("st-trace"),
+        cube=has("cube"),
+        stm32_programmer=has("STM32_Programmer_CLI"),
+        esptool=has("esptool.py") or has("esptool"),
+        idf=has("idf.py"),
+        openocd=has("openocd"),
+        arm_gdb=has("arm-none-eabi-gdb"),
+        gdb_multiarch=has("gdb-multiarch"),
+    )
+
+
+# ---------------------------------------------------------------------------
+# USB permission diagnostics
+# ---------------------------------------------------------------------------
+
+@dataclass
+class UsbPermissions:
+    udev_rules_files: list[str]        # rule files found that cover 0483 VID
+    user_groups: list[str]             # current user's supplementary groups
+    in_plugdev: bool
+    in_dialout: bool
+    stlink_devices_accessible: list[str]  # /dev/bus/usb paths that are readable
+    stlink_devices_blocked: list[str]     # paths that are NOT readable
+    ok: bool
+    issues: list[str]
+    fix_hint: str
+
+
+def check_usb_permissions() -> UsbPermissions:
+    """
+    Diagnose whether the current user has permission to open ST-Link USB devices.
+
+    Checks:
+    - udev rules files covering VID 0483 (ST-Link)
+    - group membership (plugdev, dialout)
+    - direct /dev/bus/usb read access for known ST-Link devices
+
+    The standard fix on Linux is to install udev rules from:
+    https://github.com/stlink-org/stlink/tree/master/config/udev/rules.d
+    or use the awto-stlink installer script.
+    """
+    issues: list[str] = []
+
+    # --- udev rules scan ---
+    rules_found: list[str] = []
+    for rules_path in STLINK_UDEV_RULES_PATHS:
+        p = Path(rules_path)
+        if p.exists():
+            try:
+                content = p.read_text(errors="replace")
+                if "0483" in content:
+                    rules_found.append(str(p))
+            except OSError:
+                pass
+    # Also scan rules.d directories for any file mentioning 0483
+    for rules_dir in ("/etc/udev/rules.d", "/lib/udev/rules.d", "/usr/lib/udev/rules.d"):
+        try:
+            for rf in sorted(Path(rules_dir).iterdir()):
+                if rf.suffix not in (".rules",) or str(rf) in rules_found:
+                    continue
+                try:
+                    if "0483" in rf.read_text(errors="replace"):
+                        rules_found.append(str(rf))
+                except OSError:
+                    pass
+        except OSError:
+            pass
+
+    if not rules_found:
+        issues.append(
+            "No udev rules found for VID 0483 (ST-Link). "
+            "Install rules from https://github.com/stlink-org/stlink/tree/master/config/udev/rules.d "
+            "then run: sudo udevadm control --reload-rules && sudo udevadm trigger"
+        )
+
+    # --- group membership ---
+    try:
+        user_gids = os.getgroups()
+        user_groups = [grp.getgrgid(g).gr_name for g in user_gids]
+    except Exception:
+        user_groups = []
+
+    in_plugdev = "plugdev" in user_groups
+    in_dialout = "dialout" in user_groups
+
+    if not in_plugdev:
+        issues.append(
+            "User is not in the 'plugdev' group. "
+            "Run: sudo usermod -aG plugdev $USER  then log out and back in."
+        )
+
+    # --- direct device access ---
+    accessible: list[str] = []
+    blocked: list[str] = []
+    sysfs_map = _build_sysfs_serial_map()  # (bus, dev) → serial
+    # Invert to get bus/dev for known ST-Link serials
+    try:
+        import usb.core
+        stlink_devs = usb.core.find(idVendor=STLINK_VID, find_all=True) or []
+        for dev in stlink_devs:
+            dev_path = f"/dev/bus/usb/{dev.bus:03d}/{dev.address:03d}"
+            if os.access(dev_path, os.R_OK):
+                accessible.append(dev_path)
+            else:
+                blocked.append(dev_path)
+                issues.append(f"Cannot read {dev_path} — udev rules may not have applied (replug the device?)")
+    except Exception:
+        pass
+
+    fix_hint = (
+        "Standard fix: \n"
+        "  1. Install udev rules:\n"
+        "       sudo cp stlink-udev-rules/*.rules /etc/udev/rules.d/\n"
+        "       sudo udevadm control --reload-rules && sudo udevadm trigger\n"
+        "  2. Add user to plugdev group:\n"
+        "       sudo usermod -aG plugdev $USER\n"
+        "  3. Log out and back in (or run: newgrp plugdev)\n"
+        "  4. Replug all ST-Link devices\n"
+        "\n"
+        "Upstream rules: https://github.com/stlink-org/stlink/tree/master/config/udev/rules.d\n"
+        "awto installer:  bash scripts/install-udev-rules.sh"
+    ) if issues else "Permissions look correct."
+
+    return UsbPermissions(
+        udev_rules_files=rules_found,
+        user_groups=user_groups,
+        in_plugdev=in_plugdev,
+        in_dialout=in_dialout,
+        stlink_devices_accessible=accessible,
+        stlink_devices_blocked=blocked,
+        ok=not issues,
+        issues=issues,
+        fix_hint=fix_hint,
+    )
 
     return BackendStatus(
         st_flash=has("st-flash"),
