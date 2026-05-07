@@ -2,6 +2,21 @@
 
 MCP server exposing embedded debugger tools to AI agents (Copilot, Claude, etc.).
 
+## Why this server exists
+
+MCP is useful, but embedded teams need more than tool access. This server is
+designed around three practical goals:
+
+- Repeatability first: workflows are executed server-side with consistent
+    sequencing and safety gates, so runs can be reproduced and audited.
+- Token minimization by default: compact responses reduce model context cost,
+    while full diagnostics are available only when explicitly requested.
+- Model separation from low-level debug control: the model asks for intent
+    (snapshot, flash cycle, report), and the server owns the exact command flow.
+
+The result is lower iteration cost when failures happen, especially for
+multi-target bring-up and recovery scenarios.
+
 Supports:
 - **ST-Link open-source tools** (`st-flash`, `st-info`, `st-util`, `st-trace`)
 - **STM32CubeProgrammer** (`cube` CLI / `STM32_Programmer_CLI`) for ST targets
@@ -51,11 +66,22 @@ Add to your workspace `.vscode/mcp.json` (already present):
 - `probe_info(serial?)` — MCU device-id, flash size, UID
 
 ### Managed Workflows (preferred for AI agents)
-`debug_session_start`, `debug_session_status`, `debug_session_memory_snapshot`,
-`debug_session_safe_flash_cycle`, `debug_session_report`
+`debug_session_start`, `debug_session_set_mode`, `debug_session_status`,
+`debug_session_memory_snapshot`, `debug_session_safe_flash_cycle`,
+`debug_parallel_flash_program`, `debug_user_action_request`,
+`debug_session_report`
 
 These tools move sequencing and safety policy into the MCP server so clients can
 request intent-level actions instead of manually orchestrating low-level commands.
+
+Token/use guidance:
+- Default to `response_mode='compact'` and `detail_level='compact'` to keep
+    model context small.
+- Enable `deep_debug=true` or `detail_level='full'` only while triaging issues.
+- Use `debug_parallel_flash_program` for multi-target flashing to reduce
+    iterative agent retries.
+- Use `debug_user_action_request` when manual/local execution by a human is
+    cheaper or required.
 
 ### ST-Link open-source (st-flash / st-info / st-util)
 `stlink_flash`, `stlink_erase`, `stlink_read`, `stlink_verify`, `stlink_reset`,

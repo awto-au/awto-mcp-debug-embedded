@@ -371,6 +371,17 @@ class TestDebugWorkflow(unittest.TestCase):
         self.assertEqual(session["target_info"]["chip_id"], "0x450")
         self.assertEqual(len(session["events"]), 1)
 
+    def test_start_session_can_set_compact_mode(self) -> None:
+        with patch.object(self.wf, "_pick_stlink_serial", return_value="SERMODE"):
+            with patch.object(self.wf.stlink, "chip_info", return_value={"chip_id": "0x450"}):
+                session = self.wf.start_session(
+                    target_kind="stlink",
+                    response_mode="compact",
+                    deep_debug=False,
+                )
+        self.assertEqual(session["response_mode"], "compact")
+        self.assertFalse(session["deep_debug"])
+
     def test_session_memory_snapshot_delegates_to_stlink(self) -> None:
         with patch.object(self.wf, "_pick_stlink_serial", return_value="SER2"):
             with patch.object(self.wf.stlink, "chip_info", return_value={"chip_id": "0x450"}):
@@ -385,6 +396,26 @@ class TestDebugWorkflow(unittest.TestCase):
             )
         self.assertEqual(result["serial"], "SER2")
         self.assertIn("files", result["result"])
+
+    def test_session_status_compact_hides_full_event_list(self) -> None:
+        with patch.object(self.wf, "_pick_stlink_serial", return_value="SERSTATUS"):
+            with patch.object(self.wf.stlink, "chip_info", return_value={"chip_id": "0x450"}):
+                session = self.wf.start_session(target_kind="stlink", serial=None)
+        compact = self.wf.session_status(session["id"], detail_level="compact")
+        self.assertEqual(compact["event_count"], 1)
+        self.assertNotIn("events", compact)
+
+    def test_set_session_mode_updates_flags(self) -> None:
+        with patch.object(self.wf, "_pick_stlink_serial", return_value="SERMODE2"):
+            with patch.object(self.wf.stlink, "chip_info", return_value={"chip_id": "0x450"}):
+                session = self.wf.start_session(target_kind="stlink", serial=None)
+        updated = self.wf.set_session_mode(
+            session_id=session["id"],
+            response_mode="full",
+            deep_debug=True,
+        )
+        self.assertEqual(updated["response_mode"], "full")
+        self.assertTrue(updated["deep_debug"])
 
     def test_safe_flash_cycle_requires_explicit_confirmation(self) -> None:
         with patch.object(self.wf, "_pick_stlink_serial", return_value="SER3"):
@@ -430,6 +461,32 @@ class TestDebugWorkflow(unittest.TestCase):
 
         self.assertTrue(result["restore_match"])
         self.assertIn("summary_file", result)
+
+    def test_parallel_flash_program_compact_summary(self) -> None:
+        def fake_write(_firmware: str, address: str, serial: str, reset: bool) -> str:
+            if serial == "BAD":
+                raise RuntimeError("flash failed")
+            return f"ok {serial} {address} {reset}"
+
+        with patch.object(self.wf.stlink, "flash_write", side_effect=fake_write):
+            result = self.wf.parallel_flash_program(
+                serials=["A", "BAD", "B"],
+                firmware_path="/tmp/fw.bin",
+                detail_level="compact",
+            )
+        self.assertEqual(result["requested"], 3)
+        self.assertEqual(result["ok_count"], 2)
+        self.assertEqual(result["fail_count"], 1)
+        self.assertNotIn("results", result)
+
+    def test_build_user_action_request_contains_origin(self) -> None:
+        payload = self.wf.build_user_action_request(
+            command="st-info --probe",
+            reason="Need local USB visibility check",
+        )
+        self.assertEqual(payload["action"], "ask_user_to_run_command")
+        self.assertIn("request_origin", payload)
+        self.assertIn("Dan", payload["request_origin"])
 
 
 # ---------------------------------------------------------------------------

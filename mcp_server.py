@@ -124,10 +124,15 @@ GDB client notes:
 
 Managed workflow mode:
 - Prefer debug_session_start() once per target/probe.
+- Keep token usage low by default with compact session responses.
+- Switch to deep diagnostics only when needed via debug_session_set_mode().
 - Then use debug_session_memory_snapshot(), debug_session_safe_flash_cycle(),
-    and debug_session_report() for policy-enforced, server-owned workflows.
+    debug_parallel_flash_program(), and debug_session_report() for
+    policy-enforced, server-owned workflows.
 - These tools keep sequencing, safety gates, and artifact reporting on the
     server side instead of delegating low-level control flow to the model.
+- If external/manual execution is needed, use debug_user_action_request() to
+    produce a structured ask-user payload with origin attribution.
 """,
 )
 
@@ -313,20 +318,49 @@ def probe_info(serial: Optional[str] = None) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def debug_session_start(target_kind: str = "stlink", serial: Optional[str] = None) -> dict[str, Any]:
+def debug_session_start(
+    target_kind: str = "stlink",
+    serial: Optional[str] = None,
+    response_mode: str = "compact",
+    deep_debug: bool = False,
+) -> dict[str, Any]:
     """
     Start a managed debug session bound to a specific probe serial.
 
     This is the preferred entrypoint for model-driven flows where the server
     should own sequencing and safety policy.
     """
-    return wf.start_session(target_kind=target_kind, serial=serial)
+    return wf.start_session(
+        target_kind=target_kind,
+        serial=serial,
+        response_mode=response_mode,
+        deep_debug=deep_debug,
+    )
 
 
 @mcp.tool()
-def debug_session_status(session_id: str) -> dict[str, Any]:
+def debug_session_set_mode(
+    session_id: str,
+    response_mode: str = "compact",
+    deep_debug: bool = False,
+) -> dict[str, Any]:
+    """
+    Configure token/detail behavior for a managed session.
+
+    response_mode='compact' keeps payloads concise. Set deep_debug=true to
+    force full-detail outputs for diagnostics.
+    """
+    return wf.set_session_mode(
+        session_id=session_id,
+        response_mode=response_mode,
+        deep_debug=deep_debug,
+    )
+
+
+@mcp.tool()
+def debug_session_status(session_id: str, detail_level: str = "compact") -> dict[str, Any]:
     """Return the current state and event history for a managed debug session."""
-    return wf.session_status(session_id)
+    return wf.session_status(session_id=session_id, detail_level=detail_level)
 
 
 @mcp.tool()
@@ -339,6 +373,7 @@ def debug_session_memory_snapshot(
     ram_length: Optional[int] = None,
     include_flash: bool = True,
     include_ram: bool = True,
+    detail_level: Optional[str] = None,
 ) -> dict[str, Any]:
     """
     Capture a managed memory snapshot using the session's bound probe serial.
@@ -355,6 +390,7 @@ def debug_session_memory_snapshot(
         ram_length=ram_length,
         include_flash=include_flash,
         include_ram=include_ram,
+        detail_level=detail_level,
     )
 
 
@@ -365,6 +401,7 @@ def debug_session_safe_flash_cycle(
     confirm_destructive: bool,
     flash_address: str = "0x08000000",
     flash_length: Optional[int] = None,
+    detail_level: Optional[str] = None,
 ) -> dict[str, Any]:
     """
     Run safe destructive flash workflow with explicit safety confirmation.
@@ -378,6 +415,7 @@ def debug_session_safe_flash_cycle(
         confirm_destructive=confirm_destructive,
         flash_address=flash_address,
         flash_length=flash_length,
+        detail_level=detail_level,
     )
 
 
@@ -385,6 +423,53 @@ def debug_session_safe_flash_cycle(
 def debug_session_report(session_id: str, output_path: str) -> dict[str, Any]:
     """Write a machine-readable handoff report for the managed debug session."""
     return wf.session_report(session_id=session_id, output_path=output_path)
+
+
+@mcp.tool()
+def debug_parallel_flash_program(
+    serials: list[str],
+    firmware_path: str,
+    address: str = "0x8000000",
+    reset: bool = True,
+    max_workers: int = 4,
+    continue_on_error: bool = True,
+    detail_level: str = "compact",
+) -> dict[str, Any]:
+    """
+    Program multiple ST-Link targets concurrently.
+
+    Use this for multi-target bring-up to reduce iterative retries and tool
+    round-trips.
+    """
+    return wf.parallel_flash_program(
+        serials=serials,
+        firmware_path=firmware_path,
+        address=address,
+        reset=reset,
+        max_workers=max_workers,
+        continue_on_error=continue_on_error,
+        detail_level=detail_level,
+    )
+
+
+@mcp.tool()
+def debug_user_action_request(
+    command: str,
+    reason: str,
+    expected_output: str = "",
+    request_origin: str = wf.REQUEST_ORIGIN_DEFAULT,
+) -> dict[str, Any]:
+    """
+    Build a structured payload that asks the user to run a command manually.
+
+    Intended for cases where local/manual interaction is cheaper or required.
+    """
+    return wf.build_user_action_request(
+        command=command,
+        reason=reason,
+        expected_output=expected_output,
+        request_origin=request_origin,
+    )
 
 
 # ---------------------------------------------------------------------------
