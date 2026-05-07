@@ -129,6 +129,33 @@ class TestRegistryOps(unittest.TestCase):
         result = self.pd.approve_probe("DOESNOTEXIST")
         self.assertIsNone(result)
 
+    def test_probe_permissions_default_on_approve(self) -> None:
+        probe = self._make_probe()
+        self.pd._registry_upsert_probe(probe)
+        approved = self.pd.approve_probe(probe.serial)
+        self.assertIsNotNone(approved)
+        self.assertTrue(approved.scan_allowed)
+        self.assertTrue(approved.read_allowed)
+        self.assertTrue(approved.flash_allowed)
+        self.assertTrue(approved.stop_allowed)
+
+    def test_set_probe_permissions(self) -> None:
+        probe = self._make_probe()
+        self.pd._registry_upsert_probe(probe)
+        self.pd.approve_probe(probe.serial)
+        updated = self.pd.set_probe_permissions(
+            probe.serial,
+            read_allowed=True,
+            flash_allowed=False,
+            stop_allowed=False,
+            scan_allowed=True,
+        )
+        self.assertIsNotNone(updated)
+        self.assertTrue(updated.read_allowed)
+        self.assertFalse(updated.flash_allowed)
+        self.assertFalse(updated.stop_allowed)
+        self.assertTrue(updated.scan_allowed)
+
 
 # ---------------------------------------------------------------------------
 # TestCpuRegistryOps — CPU registry identity and approval flow
@@ -166,6 +193,32 @@ class TestCpuRegistryOps(unittest.TestCase):
         self.assertTrue(self.cr.ignore_cpu(row["id"]))
         self.assertTrue(self.cr.clear_cpu(row["id"]))
         self.assertIsNone(self.cr.get_cpu(row["id"]))
+
+    def test_set_cpu_permissions(self) -> None:
+        row = self.cr.register_stm32(cpu_type="STM32H743", probe_serial="ST2")
+        self.cr.approve_cpu(row["id"])
+        updated = self.cr.set_cpu_permissions(
+            row["id"],
+            read_allowed=True,
+            flash_allowed=False,
+            stop_allowed=False,
+            scan_allowed=True,
+        )
+        self.assertIsNotNone(updated)
+        self.assertTrue(updated["read_allowed"])
+        self.assertFalse(updated["flash_allowed"])
+        self.assertFalse(updated["stop_allowed"])
+        self.assertTrue(updated["scan_allowed"])
+
+    def test_set_cpu_state_revoked_disables_permissions(self) -> None:
+        row = self.cr.register_stm32(cpu_type="STM32H723", probe_serial="ST3")
+        self.cr.approve_cpu(row["id"])
+        updated = self.cr.set_cpu_state(row["id"], "revoked")
+        self.assertIsNotNone(updated)
+        self.assertEqual(updated["state"], "revoked")
+        self.assertFalse(updated["read_allowed"])
+        self.assertFalse(updated["flash_allowed"])
+        self.assertFalse(updated["stop_allowed"])
 
 
 # ---------------------------------------------------------------------------

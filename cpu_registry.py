@@ -20,6 +20,7 @@ from typing import Any, Optional
 
 _REGISTRY_PATH: Path = Path("cpus.json")
 _registry_lock = threading.Lock()
+CPU_ALLOWED_STATES = {"pending", "approved", "ignored", "blocked", "revoked"}
 
 
 def configure_registry(path: str | Path) -> None:
@@ -47,6 +48,23 @@ def _save_registry(reg: dict[str, Any]) -> None:
         _REGISTRY_PATH.write_text(json.dumps(reg, indent=2) + "\n")
 
 
+def _normalize_cpu_row(row: dict[str, Any]) -> dict[str, Any]:
+    state = str(row.get("state") or "pending").strip().lower()
+    if state not in CPU_ALLOWED_STATES:
+        state = "pending"
+
+    is_approved = state == "approved"
+    scan_default = state not in {"ignored", "revoked"}
+
+    normalized = dict(row)
+    normalized["state"] = state
+    normalized["scan_allowed"] = bool(row.get("scan_allowed", scan_default))
+    normalized["read_allowed"] = bool(row.get("read_allowed", is_approved))
+    normalized["flash_allowed"] = bool(row.get("flash_allowed", is_approved))
+    normalized["stop_allowed"] = bool(row.get("stop_allowed", is_approved))
+    return normalized
+
+
 def _upsert(entry_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     reg = _load_registry()
     cpus: list[dict[str, Any]] = reg.setdefault("cpus", [])
@@ -54,10 +72,12 @@ def _upsert(entry_id: str, payload: dict[str, Any]) -> dict[str, Any]:
 
     for row in cpus:
         if row.get("id") == entry_id:
+            row.update(_normalize_cpu_row(row))
             state = row.get("state", "pending")
             row.update(payload)
             row["state"] = state
             row["last_seen"] = now
+            row.update(_normalize_cpu_row(row))
             _save_registry(reg)
             return row
 
@@ -68,6 +88,7 @@ def _upsert(entry_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         "last_seen": now,
         **payload,
     }
+    row.update(_normalize_cpu_row(row))
     cpus.append(row)
     _save_registry(reg)
     return row
@@ -121,11 +142,16 @@ def register_stm32(
 
 def list_cpus(kind: Optional[str] = None) -> list[dict[str, Any]]:
     """Return all CPUs, optionally filtered by kind ('esp' or 'stm32')."""
-    rows = list(_load_registry().get("cpus", []))
+    rows = [_normalize_cpu_row(row) for row in _load_registry().get("cpus", [])]
     if kind:
         kind_norm = kind.strip().lower()
         rows = [row for row in rows if str(row.get("kind", "")).lower() == kind_norm]
     return rows
+
+
+def get_all_cpus() -> list[dict[str, Any]]:
+    """Backwards-compatible alias for list_cpus()."""
+    return list_cpus()
 
 
 def approve_cpu(entry_id: str) -> Optional[dict[str, Any]]:
@@ -133,7 +159,12 @@ def approve_cpu(entry_id: str) -> Optional[dict[str, Any]]:
     reg = _load_registry()
     for row in reg.get("cpus", []):
         if row.get("id") == entry_id:
+            row.update(_normalize_cpu_row(row))
             row["state"] = "approved"
+            row["scan_allowed"] = True
+            row["read_allowed"] = True
+            row["flash_allowed"] = True
+            row["stop_allowed"] = True
             row["last_seen"] = _now_iso()
             _save_registry(reg)
             return row
@@ -145,11 +176,71 @@ def ignore_cpu(entry_id: str) -> bool:
     reg = _load_registry()
     for row in reg.get("cpus", []):
         if row.get("id") == entry_id:
+            row.update(_normalize_cpu_row(row))
             row["state"] = "ignored"
+            row["scan_allowed"] = False
+            row["read_allowed"] = False
+            row["flash_allowed"] = False
+            row["stop_allowed"] = False
             row["last_seen"] = _now_iso()
             _save_registry(reg)
             return True
     return False
+
+
+def set_cpu_state(entry_id: str, state: str) -> Optional[dict[str, Any]]:
+    """Set CPU lifecycle state. Returns updated row or None."""
+    normalized_state = (state or "").strip().lower()
+    if normalized_state not in CPU_ALLOWED_STATES:
+        raise RuntimeError(
+            f"Invalid CPU state {state!r}; allowed: {sorted(CPU_ALLOWED_STATES)}"
+        )
+
+    reg = _load_registry()
+    for row in reg.get("cpus", []):
+        if row.get("id") == entry_id:
+            row.update(_normalize_cpu_row(row))
+            row["state"] = normalized_state
+            if normalized_state in {"ignored", "blocked", "revoked"}:
+                row["read_allowed"] = False
+                row["flash_allowed"] = False
+                row["stop_allowed"] = False
+                row["scan_allowed"] = normalized_state not in {"ignored", "revoked"}
+            elif normalized_state == "approved":
+                row["scan_allowed"] = True
+            row["last_seen"] = _now_iso()
+            row.update(_normalize_cpu_row(row))
+            _save_registry(reg)
+            return row
+    return None
+
+
+def set_cpu_permissions(
+    entry_id: str,
+    *,
+    scan_allowed: Optional[bool] = None,
+    read_allowed: Optional[bool] = None,
+    flash_allowed: Optional[bool] = None,
+    stop_allowed: Optional[bool] = None,
+) -> Optional[dict[str, Any]]:
+    """Set per-action permissions for a CPU entry. Returns updated row or None."""
+    reg = _load_registry()
+    for row in reg.get("cpus", []):
+        if row.get("id") == entry_id:
+            row.update(_normalize_cpu_row(row))
+            if scan_allowed is not None:
+                row["scan_allowed"] = bool(scan_allowed)
+            if read_allowed is not None:
+                row["read_allowed"] = bool(read_allowed)
+            if flash_allowed is not None:
+                row["flash_allowed"] = bool(flash_allowed)
+            if stop_allowed is not None:
+                row["stop_allowed"] = bool(stop_allowed)
+            row["last_seen"] = _now_iso()
+            row.update(_normalize_cpu_row(row))
+            _save_registry(reg)
+            return row
+    return None
 
 
 def clear_cpu(entry_id: str) -> bool:
@@ -167,5 +258,5 @@ def get_cpu(entry_id: str) -> Optional[dict[str, Any]]:
     """Lookup a CPU registry entry by ID."""
     for row in _load_registry().get("cpus", []):
         if row.get("id") == entry_id:
-            return row
+            return _normalize_cpu_row(row)
     return None

@@ -91,6 +91,8 @@ ESP_ADAPTERS: dict[tuple[int, int], str] = {
 
 POLL_INTERVAL_S: float = 3.0
 
+PROBE_ALLOWED_STATES = {"pending", "approved", "ignored", "blocked", "revoked"}
+
 
 # ---------------------------------------------------------------------------
 # Data model
@@ -104,8 +106,12 @@ class ProbeInfo:
     nick: str          # user-chosen, default ""
     usb_vid: int
     usb_pid: int
-    state: str         # "pending" | "approved" | "ignored"
+    state: str         # "pending" | "approved" | "ignored" | "blocked" | "revoked"
     port: str = ""     # serial port path for ESP adapters
+    scan_allowed: bool = True
+    read_allowed: bool = False
+    flash_allowed: bool = False
+    stop_allowed: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -148,12 +154,38 @@ def _registry_get_probe(serial: str) -> Optional[dict[str, Any]]:
     return None
 
 
+def _normalize_probe_entry(entry: dict[str, Any]) -> dict[str, Any]:
+    state = str(entry.get("state") or "pending").strip().lower()
+    if state not in PROBE_ALLOWED_STATES:
+        state = "pending"
+
+    is_approved = state == "approved"
+    scan_default = state not in {"ignored", "revoked"}
+    return {
+        "serial": str(entry.get("serial") or ""),
+        "kind": str(entry.get("kind") or ""),
+        "model": str(entry.get("model") or ""),
+        "nick": str(entry.get("nick") or ""),
+        "usb_vid": int(entry.get("usb_vid") or 0),
+        "usb_pid": int(entry.get("usb_pid") or 0),
+        "state": state,
+        "port": str(entry.get("port") or ""),
+        "scan_allowed": bool(entry.get("scan_allowed", scan_default)),
+        "read_allowed": bool(entry.get("read_allowed", is_approved)),
+        "flash_allowed": bool(entry.get("flash_allowed", is_approved)),
+        "stop_allowed": bool(entry.get("stop_allowed", is_approved)),
+    }
+
+
 def _registry_upsert_probe(info: ProbeInfo) -> bool:
     """Insert or update probe. Returns True if registry was changed."""
     reg = _load_registry()
     probes: list[dict] = reg.setdefault("probes", [])
     for p in probes:
         if p.get("serial") == info.serial:
+            normalized = _normalize_probe_entry(p)
+            p.clear()
+            p.update(normalized)
             changed = False
             # Update mutable fields but never overwrite user choices (nick, state)
             for key in ("kind", "model", "usb_vid", "usb_pid"):
@@ -167,7 +199,7 @@ def _registry_upsert_probe(info: ProbeInfo) -> bool:
                 _save_registry(reg)
             return changed
     # New probe — add as pending
-    probes.append(asdict(info))
+    probes.append(_normalize_probe_entry(asdict(info)))
     _save_registry(reg)
     log.info("New probe registered as pending: %s (%s)", info.serial[-8:], info.model)
     return True
@@ -179,7 +211,7 @@ def get_all_probes() -> list[ProbeInfo]:
     result = []
     for p in reg.get("probes", []):
         try:
-            result.append(ProbeInfo(**{k: p.get(k, "") for k in ProbeInfo.__dataclass_fields__}))
+            result.append(ProbeInfo(**_normalize_probe_entry(p)))
         except Exception as exc:
             log.warning("Skipping malformed probe entry: %s", exc)
     return result
@@ -190,12 +222,17 @@ def approve_probe(serial: str, nick: str = "") -> Optional[ProbeInfo]:
     reg = _load_registry()
     for p in reg.get("probes", []):
         if p.get("serial") == serial:
+            p.update(_normalize_probe_entry(p))
             p["state"] = "approved"
+            p["scan_allowed"] = True
+            p["read_allowed"] = True
+            p["flash_allowed"] = True
+            p["stop_allowed"] = True
             if nick:
                 p["nick"] = nick
             _save_registry(reg)
             log.info("Probe approved: %s nick=%r", serial[-8:], p.get("nick", ""))
-            return ProbeInfo(**{k: p.get(k, "") for k in ProbeInfo.__dataclass_fields__})
+            return ProbeInfo(**_normalize_probe_entry(p))
     return None
 
 
@@ -204,11 +241,67 @@ def ignore_probe(serial: str) -> bool:
     reg = _load_registry()
     for p in reg.get("probes", []):
         if p.get("serial") == serial:
+            p.update(_normalize_probe_entry(p))
             p["state"] = "ignored"
+            p["scan_allowed"] = False
+            p["read_allowed"] = False
+            p["flash_allowed"] = False
+            p["stop_allowed"] = False
             _save_registry(reg)
             log.info("Probe ignored: %s", serial[-8:])
             return True
     return False
+
+
+def set_probe_state(serial: str, state: str) -> Optional[ProbeInfo]:
+    """Set probe lifecycle state. Returns updated probe or None."""
+    normalized_state = (state or "").strip().lower()
+    if normalized_state not in PROBE_ALLOWED_STATES:
+        raise RuntimeError(
+            f"Invalid probe state {state!r}; allowed: {sorted(PROBE_ALLOWED_STATES)}"
+        )
+
+    reg = _load_registry()
+    for p in reg.get("probes", []):
+        if p.get("serial") == serial:
+            p.update(_normalize_probe_entry(p))
+            p["state"] = normalized_state
+            if normalized_state in {"ignored", "blocked", "revoked"}:
+                p["read_allowed"] = False
+                p["flash_allowed"] = False
+                p["stop_allowed"] = False
+                p["scan_allowed"] = normalized_state not in {"ignored", "revoked"}
+            elif normalized_state == "approved":
+                p["scan_allowed"] = True
+            _save_registry(reg)
+            return ProbeInfo(**_normalize_probe_entry(p))
+    return None
+
+
+def set_probe_permissions(
+    serial: str,
+    *,
+    scan_allowed: Optional[bool] = None,
+    read_allowed: Optional[bool] = None,
+    flash_allowed: Optional[bool] = None,
+    stop_allowed: Optional[bool] = None,
+) -> Optional[ProbeInfo]:
+    """Set per-action permissions for a probe. Returns updated probe or None."""
+    reg = _load_registry()
+    for p in reg.get("probes", []):
+        if p.get("serial") == serial:
+            p.update(_normalize_probe_entry(p))
+            if scan_allowed is not None:
+                p["scan_allowed"] = bool(scan_allowed)
+            if read_allowed is not None:
+                p["read_allowed"] = bool(read_allowed)
+            if flash_allowed is not None:
+                p["flash_allowed"] = bool(flash_allowed)
+            if stop_allowed is not None:
+                p["stop_allowed"] = bool(stop_allowed)
+            _save_registry(reg)
+            return ProbeInfo(**_normalize_probe_entry(p))
+    return None
 
 
 def rename_probe(serial: str, nick: str) -> bool:
