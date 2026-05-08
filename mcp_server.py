@@ -1375,6 +1375,7 @@ def cube_flash(
     verify: bool = True,
     reset: bool = True,
     address: Optional[str] = None,
+    external_loader: Optional[str] = None,
 ) -> str:
     """
     Flash firmware using STM32CubeProgrammer.
@@ -1382,13 +1383,18 @@ def cube_flash(
     Supports .hex, .bin, .elf, .srec formats.
 
     Args:
-        firmware: Path to firmware file.
-        serial:   ST-Link serial (optional).
-        verify:   Verify flash after write (default True).
-        reset:    Hard-reset target after flash (default True).
-        address:  Write address for .bin files (e.g. "0x08000000"). Required
-                  by cube for raw binaries; auto-defaults to 0x08000000 if
-                  omitted. Ignored for .hex/.elf/.srec.
+        firmware:        Path to firmware file.
+        serial:          ST-Link serial (optional).
+        verify:          Verify flash after write (default True).
+        reset:           Hard-reset target after flash (default True).
+        address:         Write address for .bin files (e.g. "0x08000000").
+                         Required by cube for raw binaries; auto-defaults
+                         to 0x08000000 if omitted. Ignored for
+                         .hex/.elf/.srec.
+        external_loader: .stldr filename or absolute path for external
+                         memory (QSPI/OSPI/eMMC). Required for non-internal
+                         addresses, e.g. "MT25TL01G_STM32H750B-DISCO.stldr"
+                         to flash the H750B-DK QSPI at 0x90000000.
     """
     resolved_serial = _resolve_approved_stlink_serial(serial, capability="flash")
     _register_and_require_stm32_cpu(
@@ -1402,6 +1408,7 @@ def cube_flash(
         verify=verify,
         reset=reset,
         address=address,
+        external_loader=external_loader,
     )
 
 
@@ -1504,15 +1511,20 @@ def cube_read_flash(
     address: str,
     length: int,
     serial: Optional[str] = None,
+    external_loader: Optional[str] = None,
 ) -> str:
     """
     Read a flash region to a binary file via STM32CubeProgrammer.
 
     Args:
-        output_path: Destination .bin file.
-        address:     Start address (e.g. '0x08000000').
-        length:      Number of bytes.
-        serial:      ST-Link serial (optional).
+        output_path:     Destination .bin file.
+        address:         Start address (e.g. '0x08000000', '0x90000000').
+        length:          Number of bytes.
+        serial:          ST-Link serial (optional).
+        external_loader: .stldr filename or absolute path for external
+                         memory (QSPI/OSPI/eMMC). Required for non-internal
+                         addresses, e.g. "MT25TL01G_STM32H750B-DISCO.stldr"
+                         to access the H750B-DK QSPI at 0x90000000.
     """
     resolved_serial = _resolve_approved_stlink_serial(serial, capability="read")
     _register_and_require_stm32_cpu(
@@ -1520,7 +1532,10 @@ def cube_read_flash(
         resolved_serial,
         capability="read",
     )
-    return cube.flash_read(output_path, address, length, resolved_serial)
+    return cube.flash_read(
+        output_path, address, length, resolved_serial,
+        external_loader=external_loader,
+    )
 
 
 @mcp.tool()

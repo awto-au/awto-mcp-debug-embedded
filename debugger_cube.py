@@ -441,6 +441,7 @@ def flash_write(
     verify: bool = True,
     reset: bool = True,
     address: Optional[str] = None,
+    external_loader: Optional[str] = None,
 ) -> str:
     """
     Flash firmware using CubeProgrammer (-d / download).
@@ -452,14 +453,22 @@ def flash_write(
     (e.g. "0x08000000"). Auto-defaults to 0x08000000 for .bin if omitted.
     For .hex/.elf/.srec the address is embedded in the file and `address`
     is ignored.
+
+    For external memories (QSPI/OSPI/eMMC), pass `external_loader` with
+    the .stldr filename or absolute path (e.g.
+    "MT25TL01G_STM32H750B-DISCO.stldr" for the H750B-DK QSPI at 0x90000000).
     """
     prog = _detect_programmer()
+    loader = _resolve_external_loader(external_loader)
     is_bin = firmware_path.lower().endswith(".bin")
     write_addr = address if (is_bin and address) else ("0x08000000" if is_bin else None)
 
     def build(ur: bool) -> list[str]:
         connect = _connect_under_reset_args(serial) if ur else _connect_args(serial)
-        cmd = prog + connect + ["-d", firmware_path]
+        cmd = prog + connect
+        if loader:
+            cmd += ["-el", loader]
+        cmd += ["-d", firmware_path]
         if write_addr:
             cmd += [write_addr]
         if verify:
@@ -485,31 +494,84 @@ def flash_erase(serial: Optional[str] = None) -> str:
     return f"Erase OK\n{out[-200:].strip()}"
 
 
+def _resolve_external_loader(name_or_path: Optional[str]) -> Optional[str]:
+    """Resolve an external-loader spec to an absolute .stldr path.
+
+    Accepts an absolute path, a bare filename (e.g. 'MT25TL01G_STM32H750B-DISCO.stldr'),
+    or a stem (e.g. 'MT25TL01G_STM32H750B-DISCO'). Searches the cube
+    install's ExternalLoader/ directory next to the programmer binary,
+    plus standard install roots so it works whether _detect_programmer
+    returned an absolute CLI path or the `cube programmer` wrapper.
+    """
+    if not name_or_path:
+        return None
+    if os.path.isabs(name_or_path) and os.path.isfile(name_or_path):
+        return name_or_path
+    candidate_names = [name_or_path]
+    if not name_or_path.endswith(".stldr"):
+        candidate_names.append(name_or_path + ".stldr")
+
+    search_dirs: list[Path] = []
+    prog = _detect_programmer()
+    if os.path.isabs(prog[0]):
+        search_dirs.append(Path(prog[0]).parent / "ExternalLoader")
+    # Fallback: scan known install roots for any ExternalLoader directory.
+    for root in (
+        Path.home() / ".local/share/stm32cube/bundles/programmer",
+        Path("/opt/st"),
+    ):
+        if root.exists():
+            search_dirs.extend(p for p in root.rglob("ExternalLoader") if p.is_dir())
+
+    seen: set[str] = set()
+    for d in search_dirs:
+        key = str(d)
+        if key in seen:
+            continue
+        seen.add(key)
+        for cand in candidate_names:
+            full = d / cand
+            if full.is_file():
+                return str(full)
+    raise RuntimeError(
+        f"External loader not found: {name_or_path}. Searched: "
+        + ", ".join(sorted(seen)) if seen else f"External loader not found: {name_or_path}."
+    )
+
+
 def flash_read(
     output_path: str,
     address: str,
     length: int,
     serial: Optional[str] = None,
+    external_loader: Optional[str] = None,
 ) -> str:
     """
     Read a flash region to a binary file.
 
     Args:
-        output_path: Destination .bin file path.
-        address:     Start address (e.g. '0x08000000').
-        length:      Number of bytes.
+        output_path:     Destination .bin file path.
+        address:         Start address (e.g. '0x08000000', '0x90000000').
+        length:          Number of bytes.
+        external_loader: Optional .stldr name/path for external memory
+                         (e.g. QSPI/OSPI). Required for non-internal
+                         addresses like 0x90000000 on H750B-DK.
     """
     prog = _detect_programmer()
+    loader = _resolve_external_loader(external_loader)
 
     # Use `-r` (auto access width) rather than `-r64`: forcing 64-bit reads
     # on H7 internal flash @0x08000000 trips a CubeProgrammer failure mid-stream.
     # See issue #4.
     def build(ur: bool) -> list[str]:
         connect = _connect_under_reset_args(serial) if ur else _connect_args(serial)
+        cmd = prog + connect
+        if loader:
+            cmd += ["-el", loader]
         # Cube CLI syntax: -r <address> <size> <file_path>
-        return prog + connect + ["-r", address, hex(length), output_path]
+        return cmd + ["-r", address, hex(length), output_path]
 
-    out = _check_with_escalation("cube read", serial, build, timeout=120)
+    out = _check_with_escalation("cube read", serial, build, timeout=300)
     return f"Read OK → {output_path}\n{out[-200:].strip()}"
 
 
