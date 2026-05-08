@@ -110,6 +110,47 @@ def uid_address(series_or_name: str) -> Optional[int]:
 
 
 # ---------------------------------------------------------------------------
+# Family-specific package register (low 3 bits of one word)
+# ---------------------------------------------------------------------------
+# Reference: RM0090 (F4), RM0410 (F7), RM0394 (L4), AN5276 (G4), etc.
+_PACKAGE_REGS: tuple[tuple[str, int, int, dict[int, str]], ...] = (
+    ("STM32F40", 0x1FFF7BF0, 0x07, {  # F405/407/415/417 — bits[2:0]
+        0b000: "LQFP64", 0b001: "LQFP100", 0b010: "WLCSP90/UFBGA176",
+        0b011: "LQFP144", 0b100: "LQFP176/UFBGA176",
+    }),
+    ("STM32F42", 0x1FFF7BF0, 0x07, {  # F427/429/437/439
+        0b000: "LQFP100", 0b001: "LQFP144",
+        0b010: "LQFP176/UFBGA176", 0b011: "LQFP208/TFBGA216",
+    }),
+    ("STM32F43", 0x1FFF7BF0, 0x07, {
+        0b000: "LQFP100", 0b001: "LQFP144",
+        0b010: "LQFP176/UFBGA176", 0b011: "LQFP208/TFBGA216",
+    }),
+    ("STM32F7",  0x1FF0F7E0, 0x07, {  # F7xx
+        0b000: "LQFP100",  0b001: "LQFP144",  0b010: "LQFP176",
+        0b011: "LQFP208",  0b100: "WLCSP143", 0b101: "TFBGA216",
+        0b110: "UFBGA169", 0b111: "UFBGA176",
+    }),
+    ("STM32L4", 0x1FFF7500, 0x1F, {  # L4 — see RM0394
+        0b00010: "WLCSP72",  0b00011: "LQFP100",
+        0b00100: "WLCSP49",  0b00101: "UFBGA64",
+        0b00110: "LQFP64",   0b00111: "UFBGA132",
+        0b01000: "LQFP48",   0b01010: "UFBGA169",
+        0b01011: "LQFP144",
+    }),
+)
+
+
+def package_register(series_or_name: str) -> Optional[tuple[int, int, dict[int, str]]]:
+    """Return (address, mask, decode-table) for the package register, or None."""
+    s = (series_or_name or "").upper()
+    for prefix, addr, mask, table in _PACKAGE_REGS:
+        if s.startswith(prefix):
+            return addr, mask, table
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Device lookup
 # ---------------------------------------------------------------------------
 
@@ -144,9 +185,71 @@ def _parse_device_xml(path: Path) -> dict:
     bootloader_addr: Optional[int] = None
     flash_variants: list[dict] = []
     flash_base: Optional[int] = None
+    otp_regions: list[dict] = []
+    option_byte_regions: list[dict] = []
+    sram_regions: list[dict] = []
     for periph in dev.iterfind(".//Peripheral"):
         name_el = periph.find("Name")
-        if name_el is None or (name_el.text or "").strip() != "Embedded Flash":
+        pname = (name_el.text or "").strip() if name_el is not None and name_el.text else ""
+
+        # Embedded SRAM peripheral — collect SRAM banks (top-level only;
+        # nested entries with `occurrence` are sub-bank repeats).
+        if pname == "Embedded SRAM":
+            for params in periph.iter("Parameters"):
+                if params.get("occurrence"):
+                    continue
+                try:
+                    addr = int(params.get("address", "0"), 16)
+                    size = int(params.get("size", "0"), 16)
+                except ValueError:
+                    continue
+                pn = params.get("name", "")
+                sram_regions.append({
+                    "name":    pn,
+                    "address": addr,
+                    "size":    size,
+                    "size_kb": size // 1024,
+                })
+            continue
+
+        # OTP / Option-byte storage peripherals: take the bank-level summary
+        # (first Parameters element only, ignore nested register descriptors).
+        if pname == "OTP":
+            params = periph.find(".//Parameters")
+            if params is not None:
+                try:
+                    otp_regions.append({
+                        "name":    params.get("name", ""),
+                        "address": int(params.get("address", "0"), 16),
+                        "size":    int(params.get("size", "0"), 16),
+                    })
+                except ValueError:
+                    pass
+            continue
+        if pname in ("Option Bytes", "MirrorOptionBytes"):
+            for params in periph.iter("Parameters"):
+                if params.get("occurrence"):
+                    continue
+                # Skip register-detail Parameters (those live inside named
+                # config groups like "Read Out Protection"). We only want the
+                # bank-level entries directly under the peripheral.
+                # Heuristic: bank entries have name starting with "Bank" or
+                # contain "MirrorOptionBytes".
+                pn = params.get("name", "")
+                if not (pn.startswith("Bank") or "MirrorOptionBytes" in pn):
+                    continue
+                try:
+                    option_byte_regions.append({
+                        "peripheral": pname,
+                        "name":    pn,
+                        "address": int(params.get("address", "0"), 16),
+                        "size":    int(params.get("size", "0"), 16),
+                    })
+                except ValueError:
+                    pass
+            continue
+
+        if pname != "Embedded Flash":
             continue
         fsize_el = periph.find("FlashSize")
         if fsize_el is not None:
@@ -185,14 +288,19 @@ def _parse_device_xml(path: Path) -> dict:
                 "size":    size,
                 "size_kb": size // 1024,
             })
-        break
 
     info["fsize_address"] = fsize_addr
     info["fsize_default_bytes"] = fsize_default
     info["bootloader_address"] = bootloader_addr
     info["flash_base"] = flash_base
     info["flash_variants"] = flash_variants
+    info["sram_regions"] = sram_regions
+    info["otp_regions"] = otp_regions
+    info["option_byte_regions"] = option_byte_regions
     info["uid_address"] = uid_address(info["series"]) or uid_address(info["name"])
+    pkg = package_register(info["series"]) or package_register(info["name"])
+    if pkg is not None:
+        info["package_register"] = pkg[0]
     return info
 
 

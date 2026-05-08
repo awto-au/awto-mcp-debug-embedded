@@ -167,6 +167,14 @@ def probe_info(serial: Optional[str] = None) -> dict[str, Any]:
         info["cpu_freq_mhz"] = float(m.group(1))
     if m := re.search(r"Voltage\s*:\s*([0-9.]+)\s*V", combined, re.IGNORECASE):
         info["voltage"] = float(m.group(1))
+    if m := re.search(r"Revision ID\s*:\s*(\S.*)", combined, re.IGNORECASE):
+        info["revision_id"] = m.group(1).strip()
+    if m := re.search(r"BL\s*Version\s*:\s*(\S+)", combined, re.IGNORECASE):
+        info["bootloader_version"] = m.group(1).strip()
+    if m := re.search(r"ST-LINK\s*FW\s*:\s*(\S+)", combined, re.IGNORECASE):
+        info["stlink_fw"] = m.group(1).strip()
+    if m := re.search(r"Connect mode\s*:\s*(\S+)", combined, re.IGNORECASE):
+        info["connect_mode"] = m.group(1).strip()
 
     if not info:
         raise RuntimeError(
@@ -174,6 +182,45 @@ def probe_info(serial: Optional[str] = None) -> dict[str, Any]:
             f"Output: {combined[:300]}"
         )
     return info
+
+
+def read_words(
+    address: int,
+    num_words: int,
+    serial: Optional[str] = None,
+) -> list[int]:
+    """Read *num_words* 32-bit little-endian words from *address* via cube ``-r32``.
+
+    Cube's stdout looks like::
+
+        0x1FFF7A10 : 31343637 31335118 00440028
+
+    Returns the words in memory order (low address first).
+    """
+    if num_words <= 0:
+        return []
+    prog = _detect_programmer()
+    cmd = prog + _connect_args(serial) + ["-r32", f"0x{address:08X}", f"0x{num_words * 4:X}"]
+    out = _check(cmd, "read_words", timeout=15)
+    words: list[int] = []
+    for line in out.splitlines():
+        if ":" not in line:
+            continue
+        rhs = line.split(":", 1)[1]
+        for tok in rhs.split():
+            if len(tok) == 8 and all(c in "0123456789abcdefABCDEF" for c in tok):
+                try:
+                    words.append(int(tok, 16))
+                except ValueError:
+                    pass
+        if len(words) >= num_words:
+            break
+    if len(words) < num_words:
+        raise RuntimeError(
+            f"read_words: expected {num_words} words at 0x{address:08X}, "
+            f"got {len(words)}. Output: {out[:300]}"
+        )
+    return words[:num_words]
 
 
 def read_uid(serial: Optional[str] = None) -> str:
@@ -198,29 +245,7 @@ def read_uid(serial: Optional[str] = None) -> str:
             f"(series={db.get('series') if db else 'unknown'}); "
             "extend awto_debug.stm32_db._UID_ADDRS"
         )
-    uid_addr = db["uid_address"]
-
-    prog = _detect_programmer()
-    cmd = prog + _connect_args(serial) + ["-r32", f"0x{uid_addr:08X}", "0xC"]
-    out = _check(cmd, "read_uid", timeout=15)
-
-    # Cube prints lines like:  0x1FF1E800 : 36353232 34385103 003C0027
-    words: list[int] = []
-    for line in out.splitlines():
-        if ":" not in line:
-            continue
-        rhs = line.split(":", 1)[1]
-        for tok in rhs.split():
-            if len(tok) == 8 and all(c in "0123456789abcdefABCDEF" for c in tok):
-                try:
-                    words.append(int(tok, 16))
-                except ValueError:
-                    pass
-        if len(words) >= 3:
-            break
-    if len(words) < 3:
-        raise RuntimeError(f"could not parse UID from cube output: {out[:300]}")
-    w0, w1, w2 = words[0], words[1], words[2]
+    w0, w1, w2 = read_words(db["uid_address"], 3, serial)
     return f"{w2:08X}{w1:08X}{w0:08X}"
 
 

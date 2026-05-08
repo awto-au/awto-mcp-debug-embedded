@@ -1145,34 +1145,38 @@ def stm32_chip_info(serial: Optional[str] = None) -> dict[str, Any]:
     Read enriched STM32 chip identity from the live target.
 
     Combines:
-      • DBGMCU_IDCODE → device_id + name (via STM32CubeProgrammer probe).
+      • DBGMCU_IDCODE → device_id, name, revision, voltage, ST-Link FW
+        (via STM32CubeProgrammer probe).
       • STM32CubeProgrammer Data_Base XML → series, CPU, F_SIZE address,
-        flash variants, bootloader address, default flash size.
+        flash variants, SRAM banks, OTP region, option-byte region,
+        bootloader address, default flash size.
       • F_SIZE register → actual fitted flash in KB (authoritative).
       • Family-specific UID address → 96-bit unique device ID.
+      • Package register (F4/F7/L4 only) → decoded package code.
 
-    Falls back gracefully when the cube DB is not installed (returns just the
-    cube probe_info fields). Reads run via st-flash to avoid the cube CLI's
-    ``-uid`` flag bug; the probe must be approved with ``read`` capability.
+    All on-chip memory reads go through ``STM32_Programmer_CLI -r32`` (cube),
+    not st-flash, since st-flash UID readback is unreliable across families.
     """
-    import struct
-    import tempfile
-    from pathlib import Path
+    from awto_debug import stm32_db
 
     resolved_serial = _resolve_approved_stlink_serial(serial, capability="read")
     probe = cube.probe_info(resolved_serial)
     _register_and_require_stm32_cpu(probe, resolved_serial, capability="read")
 
     out: dict[str, Any] = {
-        "serial":      resolved_serial,
-        "device_id":   probe.get("device_id"),
-        "device_name": probe.get("device_name"),
-        "board_name":  probe.get("board_name"),
-        "backend":     "STM32CubeProgrammer + st-flash",
+        "serial":             resolved_serial,
+        "device_id":          probe.get("device_id"),
+        "device_name":        probe.get("device_name"),
+        "revision_id":        probe.get("revision_id"),
+        "board_name":         probe.get("board_name"),
+        "voltage":            probe.get("voltage"),
+        "cpu_freq_mhz":       probe.get("cpu_freq_mhz"),
+        "bootloader_version": probe.get("bootloader_version"),
+        "stlink_fw":          probe.get("stlink_fw"),
+        "connect_mode":       probe.get("connect_mode"),
+        "backend":            "STM32CubeProgrammer",
     }
 
-    # Cube DB enrichment (optional — may be absent on machines without CubeIDE).
-    from awto_debug import stm32_db
     db_entry = None
     devid_str = str(probe.get("device_id") or "").strip()
     if devid_str.lower().startswith("0x"):
@@ -1191,53 +1195,50 @@ def stm32_chip_info(serial: Optional[str] = None) -> dict[str, Any]:
             "flash_base":         f"0x{db_entry['flash_base']:08X}" if db_entry["flash_base"] else None,
             "bootloader_address": f"0x{db_entry['bootloader_address']:08X}" if db_entry.get("bootloader_address") else None,
             "flash_variants":     db_entry["flash_variants"],
+            "sram_regions":       db_entry.get("sram_regions") or [],
+            "otp_regions":        db_entry.get("otp_regions") or [],
+            "option_byte_regions": db_entry.get("option_byte_regions") or [],
+            "package_register":   f"0x{db_entry['package_register']:08X}" if db_entry.get("package_register") else None,
             "db_path":            db_entry["db_path"],
         })
 
     fsize_addr = db_entry["fsize_address"] if db_entry else None
     uid_addr   = db_entry["uid_address"] if db_entry else None
+    pkg_addr   = db_entry.get("package_register") if db_entry else None
 
-    # Read F_SIZE (16-bit, gives flash size in KB) via st-flash. Some families
-    # (e.g. STM32F4 at 0x1FFF7A22) place F_SIZE at an unaligned halfword;
-    # st-flash only does aligned word reads, so round down and extract the
-    # correct halfword from the read buffer.
+    # F_SIZE: 16-bit value at fsize_addr giving fitted flash KB. Cube's -r32
+    # reads at word granularity, so fetch one word and slice the right halfword
+    # (F4 places F_SIZE at 0x1FFF7A22, an unaligned halfword within 0x1FFF7A20).
     if fsize_addr is not None:
-        with tempfile.NamedTemporaryFile(suffix=".bin", delete=False) as tmp:
-            tmp_path = tmp.name
         try:
             aligned = fsize_addr & ~0x3
-            offset  = fsize_addr - aligned
-            stlink.flash_read(tmp_path, f"0x{aligned:08X}", 4, resolved_serial)
-            data = Path(tmp_path).read_bytes()
-            if len(data) >= offset + 2:
-                out["flash_size_kb"] = struct.unpack("<H", data[offset:offset + 2])[0]
-                out["flash_size_bytes"] = out["flash_size_kb"] * 1024
-        except Exception as exc:
+            offset_bits = (fsize_addr - aligned) * 8
+            word = cube.read_words(aligned, 1, resolved_serial)[0]
+            out["flash_size_kb"] = (word >> offset_bits) & 0xFFFF
+            out["flash_size_bytes"] = out["flash_size_kb"] * 1024
+        except RuntimeError as exc:
             out["flash_size_error"] = str(exc)
-        finally:
-            try:
-                Path(tmp_path).unlink()
-            except OSError:
-                pass
 
-    # Read 96-bit UID via st-flash.
     if uid_addr is not None:
-        with tempfile.NamedTemporaryFile(suffix=".bin", delete=False) as tmp:
-            tmp_path = tmp.name
         try:
-            stlink.flash_read(tmp_path, f"0x{uid_addr:08X}", 12, resolved_serial)
-            data = Path(tmp_path).read_bytes()
-            if len(data) >= 12:
-                w0, w1, w2 = struct.unpack("<III", data[:12])
-                out["uid_hex"] = f"{w2:08X}{w1:08X}{w0:08X}"
-                out["uid_words"] = [f"0x{w2:08X}", f"0x{w1:08X}", f"0x{w0:08X}"]
-        except Exception as exc:
+            w0, w1, w2 = cube.read_words(uid_addr, 3, resolved_serial)
+            out["uid_hex"] = f"{w2:08X}{w1:08X}{w0:08X}"
+            out["uid_words"] = [f"0x{w2:08X}", f"0x{w1:08X}", f"0x{w0:08X}"]
+        except RuntimeError as exc:
             out["uid_error"] = str(exc)
-        finally:
+
+    if pkg_addr is not None:
+        pkg_info = stm32_db.package_register(db_entry["series"]) or stm32_db.package_register(db_entry["name"])
+        if pkg_info is not None:
+            _addr, mask, table = pkg_info
             try:
-                Path(tmp_path).unlink()
-            except OSError:
-                pass
+                word = cube.read_words(pkg_addr, 1, resolved_serial)[0]
+                code = word & mask
+                out["package_raw"] = f"0x{word:08X}"
+                out["package_code"] = f"0x{code:02X}"
+                out["package"] = table.get(code, "unknown")
+            except RuntimeError as exc:
+                out["package_error"] = str(exc)
 
     return out
 
