@@ -70,9 +70,10 @@ Add to your workspace `.vscode/mcp.json` (already present):
 
 ## Tools
 
-### Probe discovery
-- `probe_list()` — list attached ST-Link probes + report available CLI backends
-- `probe_info(serial?)` — MCU device-id, flash size, UID
+### Probe management
+`probe_list`, `probe_approve`, `probe_ignore`, `probe_rename`, `probe_forget`,
+`probe_set_state`, `probe_set_permissions`, `probe_scan_all`, `probe_info`,
+`system_permissions_check`
 
 Approval policy:
 - Newly discovered probes and CPUs are registered as `pending`.
@@ -80,7 +81,8 @@ Approval policy:
 - User approval is required before use (`probe_approve`, `cpu_approve`).
 
 ### CPU registry
-`cpu_list`, `cpu_approve`, `cpu_ignore`, `cpu_forget`
+`cpu_list`, `cpu_approve`, `cpu_ignore`, `cpu_forget`, `cpu_set_state`,
+`cpu_set_permissions`
 
 Identity rules:
 - ESP CPUs are keyed by MAC address.
@@ -104,27 +106,35 @@ Token/use guidance:
 - Use `debug_user_action_request` when manual/local execution by a human is
     cheaper or required.
 
+### Inventory / forensics
+`target_scan_all`, `stlink_capture_artifacts`, `elf_disassemble`
+
 ### ST-Link open-source (st-flash / st-info / st-util)
-`stlink_flash`, `stlink_erase`, `stlink_read`, `stlink_verify`, `stlink_reset`,
-`stlink_memory_snapshot`, `stlink_gdb_start`, `stlink_gdb_stop`,
-`stlink_trace_start`, `stlink_trace_stop`
+`stlink_probe_list`, `stlink_flash`, `stlink_erase`, `stlink_read`,
+`stlink_memory_snapshot`, `stlink_verify`, `stlink_reset`,
+`stlink_gdb_start`, `stlink_gdb_stop`, `stlink_trace_start`, `stlink_trace_stop`
 
 ### STM32CubeProgrammer
-`cube_flash`, `cube_erase`, `cube_info`, `cube_read_uid`, `cube_otp_read`,
-`cube_otp_dump`, `cube_connection_properties`, `cube_recover`,
+`cube_flash`, `cube_erase`, `cube_info`, `cube_read_uid`, `cube_read_flash`,
+`cube_otp_read`, `cube_otp_dump`, `cube_connection_properties`, `cube_recover`,
 `cube_gdb_start`, `cube_gdb_stop`
 
 ### GDB client (GDB/MI over TCP)
-`gdb_connect`, `gdb_disconnect`, `gdb_read_memory`, `gdb_read_registers`,
-`gdb_set_breakpoint`, `gdb_delete_breakpoint`, `gdb_continue`, `gdb_halt`,
-`gdb_step`, `gdb_status`
+`gdb_connect`, `gdb_disconnect`, `gdb_status`, `gdb_halt`, `gdb_continue`,
+`gdb_step`, `gdb_step_over`, `gdb_read_memory`, `gdb_write_memory`,
+`gdb_read_registers`, `gdb_set_breakpoint`, `gdb_delete_breakpoint`,
+`gdb_list_breakpoints`
+
+### Process management
+`processes_list`, `process_stop`
 
 ### Espressif / esptool
-`esp_chip_info`, `esp_flash_write`, `esp_flash_erase`, `esp_flash_read`, `esp_reset`
+`esp_chip_info`, `esp_flash_id`, `esp_flash_write`, `esp_flash_erase`,
+`esp_flash_read`, `esp_reset`
 
 ### Espressif / idf.py
-`idf_build`, `idf_flash`, `idf_monitor_start`, `idf_monitor_stop`,
-`idf_menuconfig`, `idf_size`, `idf_openocd_start`, `idf_openocd_stop`
+`idf_build`, `idf_flash`, `idf_size`, `idf_monitor_start`, `idf_monitor_stop`,
+`idf_openocd_start`, `idf_openocd_stop`
 
 ## Architecture
 

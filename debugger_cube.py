@@ -27,8 +27,15 @@ log = logging.getLogger("awto.cube")
 # Backend detection (mirrors stlink-toolkit programmer.py pattern)
 # ---------------------------------------------------------------------------
 
-def _detect_programmer() -> list[str]:
-    """Return the base command list for STM32CubeProgrammer."""
+def find_cube_programmer() -> Optional[list[str]]:
+    """Return the base command list for STM32CubeProgrammer, or None if not found.
+
+    Resolution order:
+      1. `cube programmer` wrapper on PATH (Cube IDE helper)
+      2. `STM32_Programmer_CLI` on PATH
+      3. `STM32_Programmer_CLI` under standard install roots
+         (~/.local/share/stm32cube/bundles/programmer, /opt/st)
+    """
     if shutil.which("cube"):
         return ["cube", "programmer"]
     cli = shutil.which("STM32_Programmer_CLI")
@@ -47,11 +54,19 @@ def _detect_programmer() -> list[str]:
     if cli:
         log.debug("Using STM32_Programmer_CLI: %s", cli)
         return [cli]
-    raise RuntimeError(
-        "STM32CubeProgrammer not found. Install from "
-        "https://www.st.com/en/development-tools/stm32cubeprog.html "
-        "or install the Cube IDE bundle."
-    )
+    return None
+
+
+def _detect_programmer() -> list[str]:
+    """Return the base command list for STM32CubeProgrammer, or raise."""
+    cmd = find_cube_programmer()
+    if cmd is None:
+        raise RuntimeError(
+            "STM32CubeProgrammer not found. Install from "
+            "https://www.st.com/en/development-tools/stm32cubeprog.html "
+            "or install the Cube IDE bundle."
+        )
+    return cmd
 
 
 def _detect_gdbserver() -> Optional[str]:
@@ -263,8 +278,10 @@ def connection_properties(
         serial,
         freq=freq,
     )
+    cmd = find_cube_programmer()
+    backend = cmd[0] if cmd else None
     return {
-        "backend": shutil.which("cube") and "cube" or shutil.which("STM32_Programmer_CLI") and "STM32_Programmer_CLI" or None,
+        "backend": backend,
         "serial": serial,
         "freq_khz": freq,
         "under_reset": under_reset,

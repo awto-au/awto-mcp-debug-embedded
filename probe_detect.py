@@ -559,8 +559,7 @@ class BackendStatus:
     st_info: bool = False
     st_util: bool = False
     st_trace: bool = False
-    cube: bool = False          # cube CLI (Cube IDE helper)
-    stm32_programmer: bool = False  # standalone STM32_Programmer_CLI
+    cube: bool = False          # STM32CubeProgrammer (cube wrapper or STM32_Programmer_CLI)
     esptool: bool = False
     idf: bool = False
     openocd: bool = False
@@ -573,13 +572,17 @@ def check_backends() -> BackendStatus:
     def has(cmd: str) -> bool:
         return shutil.which(cmd) is not None
 
+    # Cube detection mirrors debugger_cube.find_cube_programmer():
+    # `cube` (Cube IDE wrapper) OR `STM32_Programmer_CLI` (PATH or install roots).
+    from debugger_cube import find_cube_programmer
+    cube_available = find_cube_programmer() is not None
+
     return BackendStatus(
         st_flash=has("st-flash"),
         st_info=has("st-info"),
         st_util=has("st-util"),
         st_trace=has("st-trace"),
-        cube=has("cube"),
-        stm32_programmer=has("STM32_Programmer_CLI"),
+        cube=cube_available,
         esptool=has("esptool.py") or has("esptool"),
         idf=has("idf.py"),
         openocd=has("openocd"),

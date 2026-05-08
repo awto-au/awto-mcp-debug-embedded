@@ -632,7 +632,8 @@ class TestBackendDetect(unittest.TestCase):
 
     def test_check_backends_returns_dataclass(self) -> None:
         import probe_detect as pd
-        with patch("shutil.which", return_value=None):
+        with patch("shutil.which", return_value=None), \
+             patch("debugger_cube.find_cube_programmer", return_value=None):
             bs = pd.check_backends()
         # All fields should be False
         d = asdict(bs)
