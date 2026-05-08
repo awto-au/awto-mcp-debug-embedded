@@ -165,6 +165,8 @@ def probe_info(serial: Optional[str] = None) -> dict[str, Any]:
         info["board_name"] = m.group(1).strip()
     if m := re.search(r"CPU\s*freq\s*:\s*([0-9.]+)\s*MHz", combined, re.IGNORECASE):
         info["cpu_freq_mhz"] = float(m.group(1))
+    if m := re.search(r"Voltage\s*:\s*([0-9.]+)\s*V", combined, re.IGNORECASE):
+        info["voltage"] = float(m.group(1))
 
     if not info:
         raise RuntimeError(
