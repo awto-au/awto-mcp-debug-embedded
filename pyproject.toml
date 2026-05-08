@@ -26,6 +26,7 @@ dependencies = [
     "libusb-package",
     "pyserial>=3.5",
     "colorlog",
+    "psutil>=5.9",
 ]
 
 [project.scripts]
@@ -43,6 +44,9 @@ include = [
     "debugger_cube.py",
     "debugger_esp.py",
     "gdb_client.py",
+    "cpu_registry.py",
+    "debug_workflow.py",
+    "awto_debug/**",
 ]
 
 [dependency-groups]

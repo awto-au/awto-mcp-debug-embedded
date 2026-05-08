@@ -1,0 +1,64 @@
+# /etc/udev/rules.d/60-awto-stlink.rules
+#
+# awto-au l8-427: ST-Link v2 / v2-1 / v3 access policy.
+#
+# Replaces the upstream /etc/udev/rules.d/49-stlinkv*.rules which reference the
+# `plugdev` group but on Fedora that group does not exist by default, so udev silently
+# drops MODE=660 GROUP=plugdev and the device falls back to root:root 0664 + a logind
+# uaccess ACL — which is timing-sensitive and intermittently grants the device
+# to a stale UID, breaking flashing with libusb errno=13 (EACCES).
+#
+# This rule:
+#   - assigns the ST-Link to group `plugdev` (created by the installer if missing) so
+#     access is restricted to root and plugdev members only (NOT world-rw),
+#   - sets mode 0660 — other unrelated user processes cannot open it,
+#   - keeps the uaccess ACL as a belt-and-braces extra for desktop sessions,
+#   - tells ModemManager to ignore the device so it doesn't probe the VCP.
+#
+# Install via:
+#   sudo bash stlink-toolkit/scripts/install-udev-rules.sh
+#
+# After install, replug both ST-Link probes (or the installer triggers a
+# change event for already-attached ones).
+
+# ST-Link v2 (0483:3744, 0483:3748)
+SUBSYSTEM=="usb", ATTRS{idVendor}=="0483", ATTRS{idProduct}=="3744", \
+    MODE="0660", GROUP="plugdev", TAG+="uaccess", ENV{ID_MM_DEVICE_IGNORE}="1", \
+    SYMLINK+="stlinkv2_%n"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="0483", ATTRS{idProduct}=="3748", \
+    MODE="0660", GROUP="plugdev", TAG+="uaccess", ENV{ID_MM_DEVICE_IGNORE}="1", \
+    SYMLINK+="stlinkv2_%n"
+
+# ST-Link v2-1 (0483:374a, 0483:374b)
+SUBSYSTEM=="usb", ATTRS{idVendor}=="0483", ATTRS{idProduct}=="374a", \
+    MODE="0660", GROUP="plugdev", TAG+="uaccess", ENV{ID_MM_DEVICE_IGNORE}="1", \
+    SYMLINK+="stlinkv2-1_%n"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="0483", ATTRS{idProduct}=="374b", \
+    MODE="0660", GROUP="plugdev", TAG+="uaccess", ENV{ID_MM_DEVICE_IGNORE}="1", \
+    SYMLINK+="stlinkv2-1_%n"
+
+# ST-Link v3 (0483:374d-3757)
+SUBSYSTEM=="usb", ATTRS{idVendor}=="0483", ATTRS{idProduct}=="374d", \
+    MODE="0660", GROUP="plugdev", TAG+="uaccess", ENV{ID_MM_DEVICE_IGNORE}="1", \
+    SYMLINK+="stlinkv3loader_%n"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="0483", ATTRS{idProduct}=="374e", \
+    MODE="0660", GROUP="plugdev", TAG+="uaccess", ENV{ID_MM_DEVICE_IGNORE}="1", \
+    SYMLINK+="stlinkv3_%n"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="0483", ATTRS{idProduct}=="374f", \
+    MODE="0660", GROUP="plugdev", TAG+="uaccess", ENV{ID_MM_DEVICE_IGNORE}="1", \
+    SYMLINK+="stlinkv3_%n"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="0483", ATTRS{idProduct}=="3752", \
+    MODE="0660", GROUP="plugdev", TAG+="uaccess", ENV{ID_MM_DEVICE_IGNORE}="1", \
+    SYMLINK+="stlinkv3_%n"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="0483", ATTRS{idProduct}=="3753", \
+    MODE="0660", GROUP="plugdev", TAG+="uaccess", ENV{ID_MM_DEVICE_IGNORE}="1", \
+    SYMLINK+="stlinkv3_%n"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="0483", ATTRS{idProduct}=="3754", \
+    MODE="0660", GROUP="plugdev", TAG+="uaccess", ENV{ID_MM_DEVICE_IGNORE}="1", \
+    SYMLINK+="stlinkv3_%n"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="0483", ATTRS{idProduct}=="3755", \
+    MODE="0660", GROUP="plugdev", TAG+="uaccess", ENV{ID_MM_DEVICE_IGNORE}="1", \
+    SYMLINK+="stlinkv3loader_%n"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="0483", ATTRS{idProduct}=="3757", \
+    MODE="0660", GROUP="plugdev", TAG+="uaccess", ENV{ID_MM_DEVICE_IGNORE}="1", \
+    SYMLINK+="stlinkv3_%n"

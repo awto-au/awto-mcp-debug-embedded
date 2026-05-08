@@ -51,7 +51,6 @@ import debugger_stlink as stlink
 import debug_workflow as wf
 import probe_detect as pd
 import cpu_registry as cr
-import stm32_ops
 from gdb_client import get_client as _gdb
 from process_manager import get_manager as _mgr
 
@@ -928,69 +927,200 @@ def stlink_read(
 
 
 @mcp.tool()
-def stm32_read_flash(
-    output_path: str,
-    address: str,
-    length: int,
+def stm32_program(
+    elf_or_bin: str,
     serial: Optional[str] = None,
+    force_full: bool = False,
+    freq: Optional[int] = None,
+    connect_under_reset: bool = True,
+    fail_fast: bool = False,
+    allow_fallback_freq: bool = False,
+    no_mode_check: bool = False,
 ) -> dict[str, Any]:
     """
-    Read a flash region using the prefer-stlink wrapper (st-flash, falling
-    back to STM32CubeProgrammer on failure).
+    Program a target with STM32CubeProgrammer (cube-primary, with full
+    reliability stack: USB-spawn flock, fast-fail libusb error detection,
+    optional SWD freq fallback, connect-under-reset, sector-0 erase recovery,
+    and USB-reset retry).
 
-    Use this in preference to cube_read_flash for plain region reads;
-    st-flash is faster and avoids cube's polling/connection-flap issues
-    (see issue #4). Returns {"backend": ..., "output_path": ..., "result": ...}.
+    This is the canonical write path. Prefer this over cube_flash() for any
+    flash-and-recover workflow; cube_flash() remains as a thin one-shot.
 
     Args:
-        output_path: Destination .bin file path.
-        address:     Start address (e.g. '0x08000000').
-        length:      Number of bytes.
-        serial:      ST-Link serial (optional).
-    """
-    resolved_serial = _resolve_approved_stlink_serial(serial, capability="read")
-    _register_and_require_stm32_cpu(
-        stlink.chip_info(resolved_serial),
-        resolved_serial,
-        capability="read",
-    )
-    return stm32_ops.read_flash(output_path, address, length, resolved_serial)
+        elf_or_bin:          Path to ELF (preferred) or BIN file.
+        serial:              ST-Link serial (optional — uses sole approved probe).
+        force_full:          Force full chip program instead of incremental.
+        freq:                SWD frequency in kHz (default: max 24000).
+        connect_under_reset: Use UR/HWrst connect (default true; safer).
+        fail_fast:           Skip retries (full-flash + USB-reset) on first failure.
+        allow_fallback_freq: Permit slow 8000 kHz recovery retry.
+                             Off by default — fallback signals a serious link issue.
+        no_mode_check:       Skip ELF/board build-mode safety check.
 
-
-@mcp.tool()
-def stm32_erase_flash(serial: Optional[str] = None) -> dict[str, Any]:
+    Returns: {"ok": bool, "elapsed_s": float, "elf": ..., "serial": ...}.
     """
-    Mass-erase target flash using the prefer-stlink wrapper.
+    import time
+    from awto_debug import programmer as awto_programmer
+    from awto_debug.usb import find_probes
 
-    See issue #4 for why st-flash is preferred over cube for repeated
-    operations. Returns {"backend": ..., "result": ...}.
-    """
     resolved_serial = _resolve_approved_stlink_serial(serial, capability="flash")
     _register_and_require_stm32_cpu(
-        stlink.chip_info(resolved_serial),
+        cube.probe_info(resolved_serial),
         resolved_serial,
         capability="flash",
     )
-    return stm32_ops.erase_flash(resolved_serial)
+    probe = next((p for p in find_probes() if p.serial == resolved_serial), None)
+    if probe is None:
+        raise RuntimeError(f"Probe {resolved_serial!r} not found via USB enumeration")
+
+    t0 = time.monotonic()
+    success, elapsed = awto_programmer.program_with_recovery(
+        elf_or_bin,
+        probe,
+        force_full=force_full,
+        freq=freq,
+        connect_under_reset=connect_under_reset,
+        fail_fast=fail_fast,
+        allow_fallback_freq=allow_fallback_freq,
+        no_mode_check=no_mode_check,
+        verbose=True,
+        passthrough=False,
+        timestamps=False,
+        include_sn=True,
+        shared=False,
+        allow_server_kill=True,
+    )
+    return {
+        "ok": bool(success),
+        "elapsed_s": round(elapsed, 2),
+        "total_s": round(time.monotonic() - t0, 2),
+        "elf": elf_or_bin,
+        "serial": resolved_serial,
+        "backend": "STM32CubeProgrammer",
+    }
 
 
 @mcp.tool()
-def stm32_verify_flash(
-    firmware: str,
+def stm32_erase(
     serial: Optional[str] = None,
+    sector0_only: bool = False,
+    freq: Optional[int] = None,
 ) -> dict[str, Any]:
     """
-    Verify flash against a firmware file using the prefer-stlink wrapper.
+    Erase target flash via STM32CubeProgrammer (mass-erase by default).
 
-    See issue #4. Returns {"backend": ..., "result": ...}.
+    Set sector0_only=True for a fast targeted sector-0 erase under reset
+    (the same recovery path used internally by stm32_program on retry).
+
+    Returns {"ok": bool, "elapsed_s": float, "serial": ...}.
     """
+    from awto_debug import programmer as awto_programmer
+    from awto_debug.usb import find_probes
+
+    resolved_serial = _resolve_approved_stlink_serial(serial, capability="flash")
+    _register_and_require_stm32_cpu(
+        cube.probe_info(resolved_serial),
+        resolved_serial,
+        capability="flash",
+    )
+    probe = next((p for p in find_probes() if p.serial == resolved_serial), None)
+    if probe is None:
+        raise RuntimeError(f"Probe {resolved_serial!r} not found via USB enumeration")
+
+    if sector0_only:
+        ok = awto_programmer.erase_sector0(probe, include_sn=True)
+        return {"ok": bool(ok), "mode": "sector0", "serial": resolved_serial}
+
+    success, elapsed = awto_programmer.erase_device(
+        probe,
+        include_sn=True,
+        shared=False,
+        freq=freq,
+        connect_under_reset=True,
+    )
+    return {
+        "ok": bool(success),
+        "elapsed_s": round(elapsed, 2),
+        "mode": "mass",
+        "serial": resolved_serial,
+        "backend": "STM32CubeProgrammer",
+    }
+
+
+@mcp.tool()
+def stm32_verify(
+    firmware: str,
+    serial: Optional[str] = None,
+    address: str = "0x08000000",
+) -> dict[str, Any]:
+    """
+    Verify on-target flash content against a local file by reading the same
+    region back via STM32CubeProgrammer and byte-comparing.
+
+    There is no native verify-only mode in STM32_Programmer_CLI; this tool
+    implements verify on top of cube_read_flash for reliability. For BIN files
+    the size is determined from the file; for ELF files use stm32_program with
+    a freshly-built ELF instead of verifying after the fact.
+
+    Returns {"ok": bool, "matched_bytes": int, "mismatch_at": int|None}.
+    """
+    import os
+    from pathlib import Path
+
     resolved_serial = _resolve_approved_stlink_serial(serial, capability="read")
     _register_and_require_stm32_cpu(
-        stlink.chip_info(resolved_serial),
+        cube.probe_info(resolved_serial),
         resolved_serial,
         capability="read",
     )
-    return stm32_ops.verify_flash(firmware, resolved_serial)
+
+    fw_path = Path(firmware)
+    if not fw_path.is_file():
+        raise RuntimeError(f"firmware not found: {firmware}")
+    if fw_path.suffix.lower() == ".elf":
+        raise RuntimeError(
+            "ELF verify not supported by this tool — use stm32_program with the "
+            "fresh ELF (cube does an integral verify pass during programming)."
+        )
+
+    expected = fw_path.read_bytes()
+    length = len(expected)
+
+    import tempfile
+    with tempfile.NamedTemporaryFile(suffix=".bin", delete=False) as tmp:
+        tmp_path = tmp.name
+    try:
+        cube.flash_read(tmp_path, address, length, resolved_serial)
+        actual = Path(tmp_path).read_bytes()
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+    if len(actual) < length:
+        return {
+            "ok": False,
+            "error": f"short read: got {len(actual)} of {length} bytes",
+            "matched_bytes": 0,
+            "mismatch_at": 0,
+        }
+
+    actual = actual[:length]
+    mismatch_at: Optional[int] = None
+    for i, (a, b) in enumerate(zip(expected, actual)):
+        if a != b:
+            mismatch_at = i
+            break
+
+    return {
+        "ok": mismatch_at is None,
+        "matched_bytes": length if mismatch_at is None else mismatch_at,
+        "mismatch_at": mismatch_at,
+        "address": address,
+        "length": length,
+        "backend": "STM32CubeProgrammer",
+    }
 
 
 @mcp.tool()
