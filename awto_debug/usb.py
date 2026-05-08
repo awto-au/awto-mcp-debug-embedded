@@ -16,6 +16,7 @@ STLINK_PIDS = (
     0x374B,
     0x374A,
     0x374E,
+    0x3752,
     0x3753,
     0x3754,
 )
@@ -26,6 +27,7 @@ STLINK_PID_TYPES = {
     0x374A: "ST-LINK/V2-1",
     0x374B: "ST-LINK/V2-1",
     0x374E: "ST-LINK/V3E",
+    0x3752: "ST-LINK/V3-MNIE",
     0x3753: "ST-LINK/V3",
     0x3754: "ST-LINK/V3",
 }
