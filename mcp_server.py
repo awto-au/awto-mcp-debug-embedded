@@ -1140,6 +1140,109 @@ def stm32_verify(
 
 
 @mcp.tool()
+def stm32_chip_info(serial: Optional[str] = None) -> dict[str, Any]:
+    """
+    Read enriched STM32 chip identity from the live target.
+
+    Combines:
+      • DBGMCU_IDCODE → device_id + name (via STM32CubeProgrammer probe).
+      • STM32CubeProgrammer Data_Base XML → series, CPU, F_SIZE address,
+        flash variants, bootloader address, default flash size.
+      • F_SIZE register → actual fitted flash in KB (authoritative).
+      • Family-specific UID address → 96-bit unique device ID.
+
+    Falls back gracefully when the cube DB is not installed (returns just the
+    cube probe_info fields). Reads run via st-flash to avoid the cube CLI's
+    ``-uid`` flag bug; the probe must be approved with ``read`` capability.
+    """
+    import struct
+    import tempfile
+    from pathlib import Path
+
+    resolved_serial = _resolve_approved_stlink_serial(serial, capability="read")
+    probe = cube.probe_info(resolved_serial)
+    _register_and_require_stm32_cpu(probe, resolved_serial, capability="read")
+
+    out: dict[str, Any] = {
+        "serial":      resolved_serial,
+        "device_id":   probe.get("device_id"),
+        "device_name": probe.get("device_name"),
+        "board_name":  probe.get("board_name"),
+        "backend":     "STM32CubeProgrammer + st-flash",
+    }
+
+    # Cube DB enrichment (optional — may be absent on machines without CubeIDE).
+    from awto_debug import stm32_db
+    db_entry = None
+    devid_str = str(probe.get("device_id") or "").strip()
+    if devid_str.lower().startswith("0x"):
+        try:
+            db_entry = stm32_db.lookup_device(int(devid_str, 16))
+        except ValueError:
+            db_entry = None
+    if db_entry:
+        out.update({
+            "series":             db_entry["series"],
+            "cpu":                db_entry["cpu"],
+            "vendor":             db_entry["vendor"],
+            "fsize_address":      f"0x{db_entry['fsize_address']:08X}" if db_entry["fsize_address"] else None,
+            "fsize_default_kb":   (db_entry["fsize_default_bytes"] // 1024) if db_entry["fsize_default_bytes"] else None,
+            "uid_address":        f"0x{db_entry['uid_address']:08X}" if db_entry["uid_address"] else None,
+            "flash_base":         f"0x{db_entry['flash_base']:08X}" if db_entry["flash_base"] else None,
+            "bootloader_address": f"0x{db_entry['bootloader_address']:08X}" if db_entry.get("bootloader_address") else None,
+            "flash_variants":     db_entry["flash_variants"],
+            "db_path":            db_entry["db_path"],
+        })
+
+    fsize_addr = db_entry["fsize_address"] if db_entry else None
+    uid_addr   = db_entry["uid_address"] if db_entry else None
+
+    # Read F_SIZE (16-bit, gives flash size in KB) via st-flash. Some families
+    # (e.g. STM32F4 at 0x1FFF7A22) place F_SIZE at an unaligned halfword;
+    # st-flash only does aligned word reads, so round down and extract the
+    # correct halfword from the read buffer.
+    if fsize_addr is not None:
+        with tempfile.NamedTemporaryFile(suffix=".bin", delete=False) as tmp:
+            tmp_path = tmp.name
+        try:
+            aligned = fsize_addr & ~0x3
+            offset  = fsize_addr - aligned
+            stlink.flash_read(tmp_path, f"0x{aligned:08X}", 4, resolved_serial)
+            data = Path(tmp_path).read_bytes()
+            if len(data) >= offset + 2:
+                out["flash_size_kb"] = struct.unpack("<H", data[offset:offset + 2])[0]
+                out["flash_size_bytes"] = out["flash_size_kb"] * 1024
+        except Exception as exc:
+            out["flash_size_error"] = str(exc)
+        finally:
+            try:
+                Path(tmp_path).unlink()
+            except OSError:
+                pass
+
+    # Read 96-bit UID via st-flash.
+    if uid_addr is not None:
+        with tempfile.NamedTemporaryFile(suffix=".bin", delete=False) as tmp:
+            tmp_path = tmp.name
+        try:
+            stlink.flash_read(tmp_path, f"0x{uid_addr:08X}", 12, resolved_serial)
+            data = Path(tmp_path).read_bytes()
+            if len(data) >= 12:
+                w0, w1, w2 = struct.unpack("<III", data[:12])
+                out["uid_hex"] = f"{w2:08X}{w1:08X}{w0:08X}"
+                out["uid_words"] = [f"0x{w2:08X}", f"0x{w1:08X}", f"0x{w0:08X}"]
+        except Exception as exc:
+            out["uid_error"] = str(exc)
+        finally:
+            try:
+                Path(tmp_path).unlink()
+            except OSError:
+                pass
+
+    return out
+
+
+@mcp.tool()
 def stlink_memory_snapshot(
     output_dir: str,
     serial: Optional[str] = None,
