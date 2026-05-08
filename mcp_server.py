@@ -1374,6 +1374,7 @@ def cube_flash(
     serial: Optional[str] = None,
     verify: bool = True,
     reset: bool = True,
+    address: Optional[str] = None,
 ) -> str:
     """
     Flash firmware using STM32CubeProgrammer.
@@ -1385,6 +1386,9 @@ def cube_flash(
         serial:   ST-Link serial (optional).
         verify:   Verify flash after write (default True).
         reset:    Hard-reset target after flash (default True).
+        address:  Write address for .bin files (e.g. "0x08000000"). Required
+                  by cube for raw binaries; auto-defaults to 0x08000000 if
+                  omitted. Ignored for .hex/.elf/.srec.
     """
     resolved_serial = _resolve_approved_stlink_serial(serial, capability="flash")
     _register_and_require_stm32_cpu(
@@ -1392,7 +1396,13 @@ def cube_flash(
         resolved_serial,
         capability="flash",
     )
-    return cube.flash_write(firmware, serial=resolved_serial, verify=verify, reset=reset)
+    return cube.flash_write(
+        firmware,
+        serial=resolved_serial,
+        verify=verify,
+        reset=reset,
+        address=address,
+    )
 
 
 @mcp.tool()

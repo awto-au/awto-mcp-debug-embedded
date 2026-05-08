@@ -118,11 +118,27 @@ def _run(cmd: list[str], timeout: int = 60) -> tuple[int, str, str]:
         raise RuntimeError(f"Command not found: {cmd[0]}")
 
 
+def _summarize_cube_error(text: str, max_len: int = 1500) -> str:
+    """Extract the meaningful error tail from cube CLI output.
+
+    Cube prints a long connect banner first, then the actual Error: lines
+    at the end. Prefer Error/Warning lines; fall back to the tail.
+    """
+    lines = [ln.rstrip() for ln in text.splitlines() if ln.strip()]
+    err_lines = [ln for ln in lines if ln.startswith(("Error", "Warning", "error:"))]
+    if err_lines:
+        summary = " | ".join(err_lines)
+        if len(summary) <= max_len:
+            return summary
+    tail = "\n".join(lines[-12:])
+    return tail[-max_len:]
+
+
 def _check(cmd: list[str], op: str, timeout: int = 60) -> str:
     rc, stdout, stderr = _run(cmd, timeout=timeout)
     combined = (stdout + stderr).strip()
     if rc != 0:
-        raise RuntimeError(f"{op} failed (rc={rc}): {combined[:500]}")
+        raise RuntimeError(f"{op} failed (rc={rc}): {_summarize_cube_error(combined)}")
     return combined
 
 
@@ -424,18 +440,28 @@ def flash_write(
     serial: Optional[str] = None,
     verify: bool = True,
     reset: bool = True,
+    address: Optional[str] = None,
 ) -> str:
     """
     Flash firmware using CubeProgrammer (-d / download).
 
     Supports .hex, .bin, .elf, .srec. Uses the standard escalation ladder
     (normal → UR → USB-reset+UR) before failing.
+
+    For .bin files cube requires an explicit write address; pass `address`
+    (e.g. "0x08000000"). Auto-defaults to 0x08000000 for .bin if omitted.
+    For .hex/.elf/.srec the address is embedded in the file and `address`
+    is ignored.
     """
     prog = _detect_programmer()
+    is_bin = firmware_path.lower().endswith(".bin")
+    write_addr = address if (is_bin and address) else ("0x08000000" if is_bin else None)
 
     def build(ur: bool) -> list[str]:
         connect = _connect_under_reset_args(serial) if ur else _connect_args(serial)
         cmd = prog + connect + ["-d", firmware_path]
+        if write_addr:
+            cmd += [write_addr]
         if verify:
             cmd += ["-v"]
         if reset:
@@ -480,7 +506,8 @@ def flash_read(
     # See issue #4.
     def build(ur: bool) -> list[str]:
         connect = _connect_under_reset_args(serial) if ur else _connect_args(serial)
-        return prog + connect + ["-r", output_path, address, hex(length)]
+        # Cube CLI syntax: -r <address> <size> <file_path>
+        return prog + connect + ["-r", address, hex(length), output_path]
 
     out = _check_with_escalation("cube read", serial, build, timeout=120)
     return f"Read OK → {output_path}\n{out[-200:].strip()}"

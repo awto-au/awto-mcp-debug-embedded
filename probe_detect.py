@@ -123,6 +123,7 @@ class ProbeInfo:
     flash_allowed: bool = False
     stop_allowed: bool = False
     target_uid: str = ""   # 96-bit STM32 chip UID, hex; populated by stm32_chip_info
+    note: str = ""         # free-form user note (e.g. "H750B-DK, shares target with ...0739")
 
 
 # ---------------------------------------------------------------------------
@@ -186,6 +187,7 @@ def _normalize_probe_entry(entry: dict[str, Any]) -> dict[str, Any]:
         "flash_allowed": bool(entry.get("flash_allowed", is_approved)),
         "stop_allowed": bool(entry.get("stop_allowed", is_approved)),
         "target_uid": str(entry.get("target_uid") or "").upper(),
+        "note": str(entry.get("note") or ""),
     }
 
 
