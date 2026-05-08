@@ -1178,6 +1178,7 @@ def stm32_chip_info(serial: Optional[str] = None) -> dict[str, Any]:
     }
     if probe.get("recovery_hint"):
         out["recovery_hint"] = probe["recovery_hint"]
+    out["status"] = "ok" if probe.get("device_id") else "needs_power_cycle"
 
     db_entry = None
     devid_str = str(probe.get("device_id") or "").strip()

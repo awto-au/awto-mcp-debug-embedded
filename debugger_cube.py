@@ -17,7 +17,7 @@ import re
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from process_manager import ProcessHandle, get_manager
 
@@ -194,6 +194,39 @@ def _try_usb_reset(serial: Optional[str]) -> bool:
         return False
 
 
+def _check_with_escalation(
+    op: str,
+    serial: Optional[str],
+    build_cmd: Callable[[bool], list[str]],
+    timeout: int = 60,
+) -> str:
+    """Run a cube command with the standard 3-step recovery ladder.
+
+    ``build_cmd(under_reset)`` must return the full argv for that mode. The
+    ladder is: normal → UR → usb_reset_stlink + UR. If all three fail, raises
+    RuntimeError with a clear "power-cycle the target" message.
+    """
+    try:
+        return _check(build_cmd(False), op, timeout=timeout)
+    except RuntimeError as exc1:
+        try:
+            return _check(build_cmd(True), f"{op}(UR)", timeout=timeout)
+        except RuntimeError as exc2:
+            if _try_usb_reset(serial):
+                try:
+                    return _check(build_cmd(True), f"{op}(UR+USBReset)", timeout=timeout)
+                except RuntimeError as exc3:
+                    raise RuntimeError(
+                        f"{op} failed after normal, under-reset, and USB-reset "
+                        f"retries. Power-cycle the target board (remove and "
+                        f"reapply VTarget) and retry. Last error: {exc3}"
+                    ) from exc3
+            raise RuntimeError(
+                f"{op} failed (normal: {exc1}; UR: {exc2}). USB reset of the "
+                f"probe was unavailable; power-cycle the target and retry."
+            ) from exc2
+
+
 def probe_info(serial: Optional[str] = None, under_reset: bool = False) -> dict[str, Any]:
     """
     Return target info from CubeProgrammer with auto-escalation.
@@ -342,24 +375,34 @@ def flash_write(
     """
     Flash firmware using CubeProgrammer (-d / download).
 
-    Supports .hex, .bin, .elf, .srec.
+    Supports .hex, .bin, .elf, .srec. Uses the standard escalation ladder
+    (normal → UR → USB-reset+UR) before failing.
     """
     prog = _detect_programmer()
-    cmd = prog + _connect_args(serial) + ["-d", firmware_path]
-    if verify:
-        cmd += ["-v"]
-    if reset:
-        cmd += ["--hardRst"]
-    out = _check(cmd, "cube flash", timeout=180)
+
+    def build(ur: bool) -> list[str]:
+        connect = _connect_under_reset_args(serial) if ur else _connect_args(serial)
+        cmd = prog + connect + ["-d", firmware_path]
+        if verify:
+            cmd += ["-v"]
+        if reset:
+            cmd += ["--hardRst"]
+        return cmd
+
+    out = _check_with_escalation("cube flash", serial, build, timeout=180)
     log.info("cube flash complete: %s", firmware_path)
     return f"Flash OK: {firmware_path}\n{out[-300:].strip()}"
 
 
 def flash_erase(serial: Optional[str] = None) -> str:
-    """Mass-erase target flash via CubeProgrammer."""
+    """Mass-erase target flash via CubeProgrammer (with escalation)."""
     prog = _detect_programmer()
-    cmd = prog + _connect_args(serial) + ["-e", "all"]
-    out = _check(cmd, "cube erase", timeout=60)
+
+    def build(ur: bool) -> list[str]:
+        connect = _connect_under_reset_args(serial) if ur else _connect_args(serial)
+        return prog + connect + ["-e", "all"]
+
+    out = _check_with_escalation("cube erase", serial, build, timeout=60)
     return f"Erase OK\n{out[-200:].strip()}"
 
 
@@ -378,13 +421,15 @@ def flash_read(
         length:      Number of bytes.
     """
     prog = _detect_programmer()
+
     # Use `-r` (auto access width) rather than `-r64`: forcing 64-bit reads
     # on H7 internal flash @0x08000000 trips a CubeProgrammer failure mid-stream.
     # See issue #4.
-    cmd = prog + _connect_args(serial) + [
-        "-r", output_path, address, hex(length),
-    ]
-    out = _check(cmd, "cube read", timeout=120)
+    def build(ur: bool) -> list[str]:
+        connect = _connect_under_reset_args(serial) if ur else _connect_args(serial)
+        return prog + connect + ["-r", output_path, address, hex(length)]
+
+    out = _check_with_escalation("cube read", serial, build, timeout=120)
     return f"Read OK → {output_path}\n{out[-200:].strip()}"
 
 
