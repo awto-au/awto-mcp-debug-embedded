@@ -69,6 +69,14 @@ def _detect_programmer() -> list[str]:
     return cmd
 
 
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+
+
+def _strip_ansi(text: str) -> str:
+    """Strip ANSI/VT100 escape sequences (cube CLI emits these unconditionally)."""
+    return _ANSI_RE.sub("", text) if text else text
+
+
 def _detect_gdbserver() -> Optional[str]:
     """Return path to ST-LINK_gdbserver or None."""
     return shutil.which("ST-LINK_gdbserver")
@@ -103,7 +111,7 @@ def _run(cmd: list[str], timeout: int = 60) -> tuple[int, str, str]:
     log.debug("run: %s", " ".join(cmd))
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-        return result.returncode, result.stdout, result.stderr
+        return result.returncode, _strip_ansi(result.stdout), _strip_ansi(result.stderr)
     except subprocess.TimeoutExpired:
         raise RuntimeError(f"Command timed out after {timeout}s: {' '.join(cmd)}")
     except FileNotFoundError:
