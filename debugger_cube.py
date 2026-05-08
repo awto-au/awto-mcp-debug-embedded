@@ -237,8 +237,11 @@ def flash_read(
         length:      Number of bytes.
     """
     prog = _detect_programmer()
+    # Use `-r` (auto access width) rather than `-r64`: forcing 64-bit reads
+    # on H7 internal flash @0x08000000 trips a CubeProgrammer failure mid-stream.
+    # See issue #4.
     cmd = prog + _connect_args(serial) + [
-        "-r64", output_path, address, hex(length),
+        "-r", output_path, address, hex(length),
     ]
     out = _check(cmd, "cube read", timeout=120)
     return f"Read OK → {output_path}\n{out[-200:].strip()}"

@@ -51,6 +51,7 @@ import debugger_stlink as stlink
 import debug_workflow as wf
 import probe_detect as pd
 import cpu_registry as cr
+import stm32_ops
 from gdb_client import get_client as _gdb
 from process_manager import get_manager as _mgr
 
@@ -924,6 +925,72 @@ def stlink_read(
         capability="read",
     )
     return stlink.flash_read(output_path, address, length, resolved_serial)
+
+
+@mcp.tool()
+def stm32_read_flash(
+    output_path: str,
+    address: str,
+    length: int,
+    serial: Optional[str] = None,
+) -> dict[str, Any]:
+    """
+    Read a flash region using the prefer-stlink wrapper (st-flash, falling
+    back to STM32CubeProgrammer on failure).
+
+    Use this in preference to cube_read_flash for plain region reads;
+    st-flash is faster and avoids cube's polling/connection-flap issues
+    (see issue #4). Returns {"backend": ..., "output_path": ..., "result": ...}.
+
+    Args:
+        output_path: Destination .bin file path.
+        address:     Start address (e.g. '0x08000000').
+        length:      Number of bytes.
+        serial:      ST-Link serial (optional).
+    """
+    resolved_serial = _resolve_approved_stlink_serial(serial, capability="read")
+    _register_and_require_stm32_cpu(
+        stlink.chip_info(resolved_serial),
+        resolved_serial,
+        capability="read",
+    )
+    return stm32_ops.read_flash(output_path, address, length, resolved_serial)
+
+
+@mcp.tool()
+def stm32_erase_flash(serial: Optional[str] = None) -> dict[str, Any]:
+    """
+    Mass-erase target flash using the prefer-stlink wrapper.
+
+    See issue #4 for why st-flash is preferred over cube for repeated
+    operations. Returns {"backend": ..., "result": ...}.
+    """
+    resolved_serial = _resolve_approved_stlink_serial(serial, capability="flash")
+    _register_and_require_stm32_cpu(
+        stlink.chip_info(resolved_serial),
+        resolved_serial,
+        capability="flash",
+    )
+    return stm32_ops.erase_flash(resolved_serial)
+
+
+@mcp.tool()
+def stm32_verify_flash(
+    firmware: str,
+    serial: Optional[str] = None,
+) -> dict[str, Any]:
+    """
+    Verify flash against a firmware file using the prefer-stlink wrapper.
+
+    See issue #4. Returns {"backend": ..., "result": ...}.
+    """
+    resolved_serial = _resolve_approved_stlink_serial(serial, capability="read")
+    _register_and_require_stm32_cpu(
+        stlink.chip_info(resolved_serial),
+        resolved_serial,
+        capability="read",
+    )
+    return stm32_ops.verify_flash(firmware, resolved_serial)
 
 
 @mcp.tool()

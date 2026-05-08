@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import subprocess
 import shutil
@@ -362,7 +363,11 @@ def flash_read(
 
 
 def flash_verify(firmware_path: str, serial: Optional[str] = None) -> str:
-    """Verify flash contents against a firmware file (hex or bin)."""
+    """Verify flash contents against a firmware file (hex or bin).
+
+    st-flash 1.8.0 requires the size argument for `verify` (same shape as
+    `read`/`write`); omitting it produces 'invalid command line'. See issue #4.
+    """
     _require("st-flash")
     fmt = "ihex" if firmware_path.endswith(".hex") else "binary"
     cmd = ["st-flash"]
@@ -371,7 +376,8 @@ def flash_verify(firmware_path: str, serial: Optional[str] = None) -> str:
     if fmt == "ihex":
         cmd += ["--format", "ihex", "verify", firmware_path]
     else:
-        cmd += ["verify", firmware_path, "0x8000000"]
+        size = os.path.getsize(firmware_path)
+        cmd += ["verify", firmware_path, "0x8000000", hex(size)]
     out = _check(cmd, "st-flash verify", timeout=60)
     return f"Verify OK: {firmware_path}\n{out[-200:].strip()}"
 
