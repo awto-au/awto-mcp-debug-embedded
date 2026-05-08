@@ -299,9 +299,15 @@ def _register_and_require_esp_cpu(
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def probe_list() -> dict[str, Any]:
+def probe_list(include_ignored: bool = False) -> dict[str, Any]:
     """
     List all detected debug probes and available debugger backends.
+
+    Args:
+        include_ignored: When False (default), suppress probes in state=ignored
+                         from the result so the listing stays focused on the
+                         probes you actually use. Set True to also see the
+                         ignored entries (e.g. before calling probe_forget).
 
     Returns:
         probes:   list of {serial, kind, model, nick, state, port, connected}
@@ -318,21 +324,29 @@ def probe_list() -> dict[str, Any]:
     all_probes = pd.get_all_probes()
     pending: list[str] = []
     probe_list_out: list[dict[str, Any]] = []
+    ignored_hidden = 0
 
     for p in all_probes:
+        if not include_ignored and p.state == "ignored":
+            ignored_hidden += 1
+            continue
         entry = asdict(p)
         entry["connected"] = p.serial in connected_serials
         probe_list_out.append(entry)
         if p.state == "pending":
             pending.append(p.serial)
 
-    # Also include probes currently connected but not yet in registry
-    # (shouldn't happen in normal flow, but guard against it)
+    # Surface probes that are live but not in the registry (e.g. CH340 chips
+    # with no stable serial — registry persistence is suppressed for them).
+    # If the same serial is already in the listing, leave that entry alone.
+    listed_serials = {p["serial"] for p in probe_list_out}
     for cp in monitor.connected_probes():
-        if not any(p["serial"] == cp.serial for p in probe_list_out):
-            entry = asdict(cp)
-            entry["connected"] = True
-            probe_list_out.append(entry)
+        if cp.serial in listed_serials:
+            continue
+        entry = asdict(cp)
+        entry["connected"] = True
+        probe_list_out.append(entry)
+        if cp.state == "pending":
             pending.append(cp.serial)
 
     backends = asdict(pd.check_backends())
@@ -341,6 +355,8 @@ def probe_list() -> dict[str, Any]:
         "pending":  pending,
         "backends": backends,
     }
+    if ignored_hidden:
+        result["ignored_hidden"] = ignored_hidden
     if pending:
         result["message"] = (
             f"{len(pending)} probe(s) await approval. "

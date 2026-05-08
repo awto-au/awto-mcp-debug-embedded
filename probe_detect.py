@@ -93,6 +93,16 @@ POLL_INTERVAL_S: float = 3.0
 
 PROBE_ALLOWED_STATES = {"pending", "approved", "ignored", "blocked", "revoked"}
 
+# Pattern for the bus:dev fallback serial used when no real USB iSerialNumber
+# can be resolved (e.g. CH340 chips that ship without a serial). These IDs are
+# not stable across reboots/replugs and must NOT be persisted to probes.json.
+import re as _re
+_SYNTHETIC_SERIAL_RE = _re.compile(r"^\d{3}:\d{3}$")
+
+
+def _is_synthetic_serial(serial: str) -> bool:
+    return bool(_SYNTHETIC_SERIAL_RE.match(serial or ""))
+
 
 # ---------------------------------------------------------------------------
 # Data model
@@ -178,7 +188,14 @@ def _normalize_probe_entry(entry: dict[str, Any]) -> dict[str, Any]:
 
 
 def _registry_upsert_probe(info: ProbeInfo) -> bool:
-    """Insert or update probe. Returns True if registry was changed."""
+    """Insert or update probe. Returns True if registry was changed.
+
+    Probes whose serial is the synthetic ``bus:dev`` fallback are NOT persisted
+    (the ID is not stable across replugs). They still appear in the live
+    monitor view via :meth:`ProbeMonitor.connected_probes`.
+    """
+    if _is_synthetic_serial(info.serial):
+        return False
     reg = _load_registry()
     probes: list[dict] = reg.setdefault("probes", [])
     for p in probes:
