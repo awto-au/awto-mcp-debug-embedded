@@ -122,6 +122,7 @@ class ProbeInfo:
     read_allowed: bool = False
     flash_allowed: bool = False
     stop_allowed: bool = False
+    target_uid: str = ""   # 96-bit STM32 chip UID, hex; populated by stm32_chip_info
 
 
 # ---------------------------------------------------------------------------
@@ -184,6 +185,7 @@ def _normalize_probe_entry(entry: dict[str, Any]) -> dict[str, Any]:
         "read_allowed": bool(entry.get("read_allowed", is_approved)),
         "flash_allowed": bool(entry.get("flash_allowed", is_approved)),
         "stop_allowed": bool(entry.get("stop_allowed", is_approved)),
+        "target_uid": str(entry.get("target_uid") or "").upper(),
     }
 
 
@@ -319,6 +321,41 @@ def set_probe_permissions(
             _save_registry(reg)
             return ProbeInfo(**_normalize_probe_entry(p))
     return None
+
+
+def set_probe_target_uid(serial: str, uid_hex: str) -> bool:
+    """Persist the connected target chip's 96-bit UID against this probe.
+
+    Used to detect when two physical probes are wired to the same target
+    (e.g. an onboard ST-Link plus an external V3SET on the same SWD header).
+    Returns True if updated.
+    """
+    if not serial or not uid_hex:
+        return False
+    normalized = uid_hex.strip().upper()
+    reg = _load_registry()
+    for p in reg.get("probes", []):
+        if p.get("serial") == serial:
+            if str(p.get("target_uid") or "").upper() == normalized:
+                return False
+            p["target_uid"] = normalized
+            _save_registry(reg)
+            log.info("Probe %s target_uid set to %s", serial[-8:], normalized)
+            return True
+    return False
+
+
+def find_probes_by_target_uid(uid_hex: str, exclude_serial: str = "") -> list[str]:
+    """Return serials of other probes recorded against the same target UID."""
+    if not uid_hex:
+        return []
+    normalized = uid_hex.strip().upper()
+    reg = _load_registry()
+    out: list[str] = []
+    for p in reg.get("probes", []):
+        if str(p.get("target_uid") or "").upper() == normalized and p.get("serial") != exclude_serial:
+            out.append(str(p.get("serial")))
+    return out
 
 
 def rename_probe(serial: str, nick: str) -> bool:

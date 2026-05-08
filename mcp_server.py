@@ -1227,6 +1227,10 @@ def stm32_chip_info(serial: Optional[str] = None) -> dict[str, Any]:
             w0, w1, w2 = cube.read_words(uid_addr, 3, resolved_serial)
             out["uid_hex"] = f"{w2:08X}{w1:08X}{w0:08X}"
             out["uid_words"] = [f"0x{w2:08X}", f"0x{w1:08X}", f"0x{w0:08X}"]
+            pd.set_probe_target_uid(resolved_serial, out["uid_hex"])
+            siblings = pd.find_probes_by_target_uid(out["uid_hex"], exclude_serial=resolved_serial)
+            if siblings:
+                out["sibling_probes"] = siblings
         except RuntimeError as exc:
             out["uid_error"] = str(exc)
 

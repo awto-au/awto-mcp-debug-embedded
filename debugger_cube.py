@@ -194,17 +194,35 @@ def _try_usb_reset(serial: Optional[str]) -> bool:
         return False
 
 
+def _try_power_cycle(serial: Optional[str]) -> bool:
+    """Best-effort uhubctl power-cycle of the ST-Link's USB port. Returns True on success."""
+    if not serial:
+        return False
+    try:
+        from awto_debug.usb import power_cycle_stlink
+    except Exception:
+        return False
+    try:
+        return bool(power_cycle_stlink(serial))
+    except Exception:
+        return False
+
+
 def _check_with_escalation(
     op: str,
     serial: Optional[str],
     build_cmd: Callable[[bool], list[str]],
     timeout: int = 60,
 ) -> str:
-    """Run a cube command with the standard 3-step recovery ladder.
+    """Run a cube command with the standard recovery ladder.
 
-    ``build_cmd(under_reset)`` must return the full argv for that mode. The
-    ladder is: normal → UR → usb_reset_stlink + UR. If all three fail, raises
-    RuntimeError with a clear "power-cycle the target" message.
+    ``build_cmd(under_reset)`` must return the full argv for that mode. Ladder:
+      1. normal
+      2. UR (connect-under-reset)
+      3. usb_reset_stlink + UR
+      4. uhubctl VBUS power-cycle + UR  (only on PPPS-capable hubs)
+
+    Raises RuntimeError with a clear power-cycle message if all steps fail.
     """
     try:
         return _check(build_cmd(False), op, timeout=timeout)
@@ -215,15 +233,21 @@ def _check_with_escalation(
             if _try_usb_reset(serial):
                 try:
                     return _check(build_cmd(True), f"{op}(UR+USBReset)", timeout=timeout)
-                except RuntimeError as exc3:
+                except RuntimeError:
+                    pass
+            if _try_power_cycle(serial):
+                try:
+                    return _check(build_cmd(True), f"{op}(UR+PowerCycle)", timeout=timeout)
+                except RuntimeError as exc4:
                     raise RuntimeError(
-                        f"{op} failed after normal, under-reset, and USB-reset "
-                        f"retries. Power-cycle the target board (remove and "
-                        f"reapply VTarget) and retry. Last error: {exc3}"
-                    ) from exc3
+                        f"{op} failed after normal, UR, USB-reset, and uhubctl "
+                        f"power-cycle. Target SWD AP unresponsive — check NRST "
+                        f"wiring, RDP level, and target firmware. Last error: {exc4}"
+                    ) from exc4
             raise RuntimeError(
-                f"{op} failed (normal: {exc1}; UR: {exc2}). USB reset of the "
-                f"probe was unavailable; power-cycle the target and retry."
+                f"{op} failed (normal: {exc1}; UR: {exc2}). Probe USB reset / "
+                f"uhubctl power-cycle did not recover the target. Manually "
+                f"power-cycle VTarget (remove and reapply) and retry."
             ) from exc2
 
 
@@ -267,10 +291,21 @@ def probe_info(serial: Optional[str] = None, under_reset: bool = False) -> dict[
         except RuntimeError:
             pass
 
+    # Step 4: uhubctl VBUS power-cycle, then UR connect (PPPS hubs only).
+    if _try_power_cycle(serial):
+        try:
+            ur3 = _probe_info_once(serial, under_reset=True)
+            if "device_id" in ur3:
+                ur3.setdefault("connect_mode", "UnderReset+PowerCycle")
+                return ur3
+        except RuntimeError:
+            pass
+
     # Give up — return banner info plus a hint.
     info["recovery_hint"] = (
-        "SWD AP did not respond after normal, under-reset, and USB-reset retries. "
-        "Power-cycle the target (or hold NRST low while replugging) and try again."
+        "SWD AP did not respond after normal, under-reset, USB-reset, and "
+        "uhubctl power-cycle retries. Power-cycle the target manually "
+        "(remove and reapply VTarget, or hold NRST low while replugging)."
     )
     return info
 
@@ -309,12 +344,22 @@ def read_words(
         except RuntimeError as exc2:
             # Step 3: USB-reset, then under-reset again.
             if _try_usb_reset(serial):
-                out = _attempt(use_ur=True)
+                try:
+                    out = _attempt(use_ur=True)
+                except RuntimeError:
+                    out = None  # try power-cycle
             else:
-                raise RuntimeError(
-                    f"read_words failed (normal: {exc1}; UR: {exc2}); "
-                    "USB reset unavailable. Power-cycle the target and retry."
-                ) from exc2
+                out = None
+            if out is None:
+                # Step 4: uhubctl VBUS power-cycle, then UR (PPPS hubs only).
+                if _try_power_cycle(serial):
+                    out = _attempt(use_ur=True)
+                else:
+                    raise RuntimeError(
+                        f"read_words failed (normal: {exc1}; UR: {exc2}); "
+                        "USB reset and uhubctl power-cycle did not recover. "
+                        "Power-cycle the target manually and retry."
+                    ) from exc2
     words: list[int] = []
     for line in out.splitlines():
         if ":" not in line:

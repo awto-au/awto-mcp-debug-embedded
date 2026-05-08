@@ -405,6 +405,70 @@ def _usb_reset_stlink_impl(serial: Optional[str] = None) -> bool:
         return False
 
 
+def _hub_location_and_port(sysfs_name: str) -> Optional[tuple[str, str]]:
+    """Split a sysfs USB path like '1-1.4.2' or '1-5' into (hub_location, port).
+
+    uhubctl wants ``-l <hub_location> -p <port>``; for '1-1.4.2' that's
+    ('1-1.4', '2'); for '1-5' that's ('1', '5').
+    Returns None if the path doesn't match either form.
+    """
+    if "." in sysfs_name:
+        hub, _, port = sysfs_name.rpartition(".")
+        return (hub, port) if hub and port else None
+    if "-" in sysfs_name:
+        bus, _, port = sysfs_name.partition("-")
+        return (bus, port) if bus and port else None
+    return None
+
+
+def power_cycle_stlink(serial: Optional[str], delay_s: float = 2.0) -> bool:
+    """Hard VBUS power-cycle of the ST-Link's USB port via uhubctl.
+
+    Only works on hubs that support per-port power switching (PPPS). Returns
+    True on success, False otherwise (including when uhubctl is missing, the
+    hub lacks PPPS, or the probe cannot be located). Re-enumeration is polled
+    for up to 5s after the cycle.
+    """
+    if sys.platform != "linux":
+        return False
+    uhubctl = shutil.which("uhubctl")
+    if not uhubctl:
+        return False
+
+    try:
+        preferred_pid: Optional[int] = None
+        if serial:
+            entry = lookup_probe(serial) or {}
+            preferred_pid = entry.get("usb_pid")
+
+        dev = _find_stlink_by_serial(serial, preferred_pid)
+        if dev is None:
+            return False
+
+        bus, devaddr = int(dev.bus), int(dev.address)
+        found_pid = int(dev.idProduct)
+        node = _find_usb_sysfs_node(bus, devaddr, serial)
+        if node is None:
+            return False
+
+        loc_port = _hub_location_and_port(node.name)
+        if loc_port is None:
+            return False
+        hub_location, port = loc_port
+
+        result = subprocess.run(
+            [uhubctl, "-l", hub_location, "-p", port, "-a", "cycle", "-d", str(int(delay_s))],
+            capture_output=True, text=True, timeout=15,
+        )
+        if result.returncode != 0:
+            return False
+
+        return _poll_stlink_reenumerated(8.0, serial, found_pid)
+
+    except Exception:
+        return False
+
+
 def reset_detected_stlink_usb_devices() -> None:
     _reset_detected_stlink_usb_devices_impl()
 
