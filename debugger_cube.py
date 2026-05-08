@@ -175,17 +175,51 @@ def probe_info(serial: Optional[str] = None) -> dict[str, Any]:
 
 
 def read_uid(serial: Optional[str] = None) -> str:
-    """Read the 96-bit STM32 unique device ID (UID)."""
+    """Read the 96-bit STM32 unique device ID (UID).
+
+    The cube CLI ``-uid`` flag is unreliable across families (returns empty on
+    H7 etc.), so resolve the UID base address from the cube DB by family and
+    read 12 bytes via cube's ``-r32`` memory read instead. Returns the canonical
+    ST display form ``w2 w1 w0`` concatenated as 24 hex chars.
+    """
+    import struct
+    from awto_debug import stm32_db
+
+    info = probe_info(serial)
+    devid_str = str(info.get("device_id") or "")
+    if not devid_str.lower().startswith("0x"):
+        raise RuntimeError(f"could not determine device_id for UID lookup: {info!r}")
+    db = stm32_db.lookup_device(int(devid_str, 16))
+    if db is None or not db.get("uid_address"):
+        raise RuntimeError(
+            f"no UID address known for device_id {devid_str} "
+            f"(series={db.get('series') if db else 'unknown'}); "
+            "extend awto_debug.stm32_db._UID_ADDRS"
+        )
+    uid_addr = db["uid_address"]
+
     prog = _detect_programmer()
-    # Standard UID base address for most STM32 families; auto-detect via --uid flag
-    cmd = prog + _connect_args(serial) + ["-uid"]
-    rc, stdout, stderr = _run(cmd, timeout=15)
-    combined = stdout + stderr
-    if m := re.search(r"UID\s*:\s*([0-9A-Fa-f\s\-]+)", combined, re.IGNORECASE):
-        return m.group(1).strip().replace(" ", "").replace("-", "")
-    if rc != 0:
-        raise RuntimeError(f"read_uid failed (rc={rc}): {combined[:300]}")
-    return combined.strip()
+    cmd = prog + _connect_args(serial) + ["-r32", f"0x{uid_addr:08X}", "0xC"]
+    out = _check(cmd, "read_uid", timeout=15)
+
+    # Cube prints lines like:  0x1FF1E800 : 36353232 34385103 003C0027
+    words: list[int] = []
+    for line in out.splitlines():
+        if ":" not in line:
+            continue
+        rhs = line.split(":", 1)[1]
+        for tok in rhs.split():
+            if len(tok) == 8 and all(c in "0123456789abcdefABCDEF" for c in tok):
+                try:
+                    words.append(int(tok, 16))
+                except ValueError:
+                    pass
+        if len(words) >= 3:
+            break
+    if len(words) < 3:
+        raise RuntimeError(f"could not parse UID from cube output: {out[:300]}")
+    w0, w1, w2 = words[0], words[1], words[2]
+    return f"{w2:08X}{w1:08X}{w0:08X}"
 
 
 # ---------------------------------------------------------------------------
