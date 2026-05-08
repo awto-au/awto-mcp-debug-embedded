@@ -1176,6 +1176,8 @@ def stm32_chip_info(serial: Optional[str] = None) -> dict[str, Any]:
         "connect_mode":       probe.get("connect_mode"),
         "backend":            "STM32CubeProgrammer",
     }
+    if probe.get("recovery_hint"):
+        out["recovery_hint"] = probe["recovery_hint"]
 
     db_entry = None
     devid_str = str(probe.get("device_id") or "").strip()

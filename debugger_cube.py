@@ -140,15 +140,11 @@ def _connect_under_reset_args(serial: Optional[str], freq: int = 4000) -> list[s
 # Probe / target info
 # ---------------------------------------------------------------------------
 
-def probe_info(serial: Optional[str] = None) -> dict[str, Any]:
-    """
-    Return target info from CubeProgrammer.
-
-    Returns dict with: device_id, device_name, flash_size_kb, ram_size_kb,
-    uid_str, board_name, cpu_freq_mhz.
-    """
+def _probe_info_once(serial: Optional[str], under_reset: bool) -> dict[str, Any]:
+    """Single cube ``-i`` attempt. Returns whatever fields we could parse."""
     prog = _detect_programmer()
-    cmd = prog + _connect_args(serial) + ["-i"]
+    connect = _connect_under_reset_args(serial) if under_reset else _connect_args(serial)
+    cmd = prog + connect + ["-i"]
     rc, stdout, stderr = _run(cmd, timeout=20)
     combined = stdout + stderr
     info: dict[str, Any] = {}
@@ -184,10 +180,73 @@ def probe_info(serial: Optional[str] = None) -> dict[str, Any]:
     return info
 
 
+def _try_usb_reset(serial: Optional[str]) -> bool:
+    """Best-effort USB reset of the ST-Link. Returns True if attempted."""
+    if not serial:
+        return False
+    try:
+        from awto_debug.usb import usb_reset_stlink
+    except Exception:
+        return False
+    try:
+        return bool(usb_reset_stlink(serial))
+    except Exception:
+        return False
+
+
+def probe_info(serial: Optional[str] = None, under_reset: bool = False) -> dict[str, Any]:
+    """
+    Return target info from CubeProgrammer with auto-escalation.
+
+    Escalation ladder when no ``Device ID`` is read (probe is healthy but
+    target SWD AP isn't responding — typical when target firmware reconfigures
+    PA13/PA14 or sleeps the core):
+
+      1. normal connect
+      2. connect-under-reset (``mode=UR``, holds NRST low)
+      3. USB-reset of the ST-Link, then connect-under-reset again
+
+    If all three fail, the result includes ``recovery_hint`` asking the user
+    to power-cycle the target. Caller can force step 2 only with
+    ``under_reset=True``.
+    """
+    # Step 1: normal (or caller-forced UR) connect.
+    info = _probe_info_once(serial, under_reset=under_reset)
+    if "device_id" in info or under_reset:
+        return info
+
+    # Step 2: under-reset retry.
+    try:
+        ur_info = _probe_info_once(serial, under_reset=True)
+        if "device_id" in ur_info:
+            ur_info.setdefault("connect_mode", "UnderReset")
+            return ur_info
+    except RuntimeError:
+        ur_info = None  # noqa: F841
+
+    # Step 3: USB-reset the probe, then UR connect.
+    if _try_usb_reset(serial):
+        try:
+            ur2 = _probe_info_once(serial, under_reset=True)
+            if "device_id" in ur2:
+                ur2.setdefault("connect_mode", "UnderReset+USBReset")
+                return ur2
+        except RuntimeError:
+            pass
+
+    # Give up — return banner info plus a hint.
+    info["recovery_hint"] = (
+        "SWD AP did not respond after normal, under-reset, and USB-reset retries. "
+        "Power-cycle the target (or hold NRST low while replugging) and try again."
+    )
+    return info
+
+
 def read_words(
     address: int,
     num_words: int,
     serial: Optional[str] = None,
+    under_reset: bool = False,
 ) -> list[int]:
     """Read *num_words* 32-bit little-endian words from *address* via cube ``-r32``.
 
@@ -200,8 +259,29 @@ def read_words(
     if num_words <= 0:
         return []
     prog = _detect_programmer()
-    cmd = prog + _connect_args(serial) + ["-r32", f"0x{address:08X}", f"0x{num_words * 4:X}"]
-    out = _check(cmd, "read_words", timeout=15)
+
+    def _attempt(use_ur: bool) -> str:
+        connect = _connect_under_reset_args(serial) if use_ur else _connect_args(serial)
+        cmd = prog + connect + ["-r32", f"0x{address:08X}", f"0x{num_words * 4:X}"]
+        return _check(cmd, "read_words" + ("(UR)" if use_ur else ""), timeout=15)
+
+    try:
+        out = _attempt(use_ur=under_reset)
+    except RuntimeError as exc1:
+        if under_reset:
+            raise
+        # Step 2: under-reset.
+        try:
+            out = _attempt(use_ur=True)
+        except RuntimeError as exc2:
+            # Step 3: USB-reset, then under-reset again.
+            if _try_usb_reset(serial):
+                out = _attempt(use_ur=True)
+            else:
+                raise RuntimeError(
+                    f"read_words failed (normal: {exc1}; UR: {exc2}); "
+                    "USB reset unavailable. Power-cycle the target and retry."
+                ) from exc2
     words: list[int] = []
     for line in out.splitlines():
         if ":" not in line:
