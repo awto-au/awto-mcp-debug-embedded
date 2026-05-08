@@ -31,6 +31,9 @@ from __future__ import annotations
 import argparse
 import logging
 import logging.handlers
+import re
+import shutil
+import subprocess
 import sys
 from dataclasses import asdict
 from pathlib import Path
@@ -1553,6 +1556,265 @@ def idf_openocd_start(
 def idf_openocd_stop(handle_id: str) -> str:
     """Stop a running OpenOCD process."""
     return esp.openocd_stop(handle_id)
+
+
+# ---------------------------------------------------------------------------
+# ── Inventory / forensics / ELF tools ─────────────────────────────────────
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def target_scan_all() -> dict[str, Any]:
+    """
+    Probe all currently-connected targets and register CPU identities.
+
+    This performs read-only target identification:
+    - ST-Link targets: st-info based chip scan per probe serial
+    - ESP targets: esptool chip_info per serial port (if port is known)
+
+    Returns discovered CPU rows and per-probe errors/skips.
+    """
+    live = pd.enumerate_all_probes()
+    reg_by_serial = {p.serial: p for p in pd.get_all_probes()}
+
+    discovered: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
+    stlink_scan: list[dict[str, Any]] = []
+    try:
+        stlink_scan = stlink.probe_list()
+    except RuntimeError:
+        stlink_scan = []
+    stlink_by_serial = {
+        str(row.get("serial") or ""): row
+        for row in stlink_scan
+        if row.get("serial")
+    }
+
+    for probe in live:
+        policy_probe = reg_by_serial.get(probe.serial, probe)
+        if not bool(getattr(policy_probe, "scan_allowed", True)):
+            skipped.append({
+                "serial": probe.serial,
+                "kind": probe.kind,
+                "reason": "scan blocked by probe policy",
+            })
+            continue
+
+        if probe.kind == "stlink":
+            try:
+                info = stlink_by_serial.get(probe.serial)
+                if not info:
+                    info = stlink.chip_info(probe.serial)
+                row = cr.register_stm32(
+                    cpu_type=str(info.get("device_name") or info.get("chip_id") or "unknown"),
+                    probe_serial=probe.serial,
+                    details=info,
+                )
+                discovered.append({
+                    "probe_serial": probe.serial,
+                    "probe_model": probe.model,
+                    "cpu": row,
+                    "chip_info": info,
+                })
+            except RuntimeError as exc:
+                errors.append({
+                    "serial": probe.serial,
+                    "kind": "stlink",
+                    "error": str(exc),
+                })
+            continue
+
+        if probe.kind == "esp":
+            port = probe.port or getattr(policy_probe, "port", "")
+            if not port:
+                skipped.append({
+                    "serial": probe.serial,
+                    "kind": "esp",
+                    "reason": "no serial port mapped",
+                })
+                continue
+            try:
+                try:
+                    info = esp.chip_info(port=port, baud=460800)
+                except RuntimeError as exc:
+                    # Compatibility fallback for esptool versions that don't support --json.
+                    if "usage: esptool" not in str(exc).lower():
+                        raise
+                    tool = shutil.which("esptool.py") or shutil.which("esptool")
+                    if not tool:
+                        raise
+                    legacy = subprocess.run(
+                        [tool, "--port", port, "--baud", "460800", "chip_id"],
+                        capture_output=True,
+                        text=True,
+                    )
+                    combined = (legacy.stdout + legacy.stderr).strip()
+                    info = {}
+                    if m := re.search(r"Chip is\s+(.+?)[\r\n]", combined):
+                        info["chip_type"] = m.group(1).strip()
+                    if m := re.search(r"MAC:\s+([0-9a-f:]+)", combined, re.IGNORECASE):
+                        info["mac"] = m.group(1).strip()
+                    if not info:
+                        raise RuntimeError(f"legacy esptool chip_id parse failed: {combined[:300]}")
+                row = cr.register_esp(
+                    mac=str(info.get("mac") or "").strip(),
+                    chip_type=str(info.get("chip_type") or "unknown"),
+                    port=port,
+                    details=info,
+                )
+                discovered.append({
+                    "probe_serial": probe.serial,
+                    "probe_model": probe.model,
+                    "port": port,
+                    "cpu": row,
+                    "chip_info": info,
+                })
+            except RuntimeError as exc:
+                errors.append({
+                    "serial": probe.serial,
+                    "kind": "esp",
+                    "port": port,
+                    "error": str(exc),
+                })
+
+    return {
+        "connected_count": len(live),
+        "discovered": discovered,
+        "skipped": skipped,
+        "errors": errors,
+        "cpus": cr.list_cpus(),
+    }
+
+
+@mcp.tool()
+def stlink_capture_artifacts(
+    output_dir: str,
+    serial: Optional[str] = None,
+    include_flash: bool = True,
+    include_ram: bool = False,
+    include_otp: bool = True,
+    flash_address: str = "0x08000000",
+    flash_length: Optional[int] = None,
+    ram_address: str = "0x20000000",
+    ram_length: Optional[int] = None,
+) -> dict[str, Any]:
+    """
+    Capture ST-Link target artifacts to a local directory.
+
+    Writes per-target artifacts under:
+      <output_dir>/<serial_tail>/
+
+    Includes:
+    - flash/ram snapshot files via st-flash (optional)
+    - option-bytes/OTP text via CubeProgrammer (optional)
+    """
+    resolved_serial = _resolve_approved_stlink_serial(serial, capability="read")
+    _register_and_require_stm32_cpu(stlink.chip_info(resolved_serial), resolved_serial, capability="read")
+
+    dest = Path(output_dir) / resolved_serial[-8:]
+    dest.mkdir(parents=True, exist_ok=True)
+
+    result: dict[str, Any] = {
+        "serial": resolved_serial,
+        "output_dir": str(dest),
+        "flash_ram": None,
+        "otp": None,
+        "warnings": [],
+    }
+
+    if include_flash or include_ram:
+        result["flash_ram"] = stlink.dump_memory_snapshot(
+            output_dir=str(dest),
+            serial=resolved_serial,
+            flash_address=flash_address,
+            flash_length=flash_length,
+            ram_address=ram_address,
+            ram_length=ram_length,
+            include_flash=include_flash,
+            include_ram=include_ram,
+        )
+
+    if include_otp:
+        otp_path = dest / "otp.txt"
+        try:
+            result["otp"] = cube.dump_otp(str(otp_path), resolved_serial)
+        except RuntimeError as exc:
+            result["warnings"].append(
+                f"OTP capture failed: {exc}. Install cube or STM32_Programmer_CLI to enable OTP dump."
+            )
+
+    return result
+
+
+@mcp.tool()
+def elf_disassemble(
+    elf_path: str,
+    output_path: Optional[str] = None,
+    include_source: bool = False,
+) -> dict[str, Any]:
+    """
+    Disassemble an ELF file and extract quick product/board hints.
+
+    Uses objdump/readelf/strings when available and writes the disassembly text
+    to a local file for offline review.
+    """
+    elf = Path(elf_path)
+    if not elf.exists():
+        raise RuntimeError(f"ELF file not found: {elf_path}")
+
+    objdump = shutil.which("arm-none-eabi-objdump") or shutil.which("objdump")
+    if not objdump:
+        raise RuntimeError("No objdump found. Install binutils or gcc-arm-none-eabi toolchain.")
+
+    disasm_out = Path(output_path) if output_path else elf.with_suffix(elf.suffix + ".disasm.txt")
+    disasm_out.parent.mkdir(parents=True, exist_ok=True)
+
+    cmd = [objdump, "-d", "-C", str(elf)]
+    if include_source:
+        cmd.insert(1, "-S")
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise RuntimeError(f"objdump disassembly failed (rc={proc.returncode}): {(proc.stderr or proc.stdout)[:500]}")
+    disasm_out.write_text(proc.stdout)
+
+    readelf = shutil.which("arm-none-eabi-readelf") or shutil.which("readelf")
+    elf_header = ""
+    machine = ""
+    entry = ""
+    if readelf:
+        hdr = subprocess.run([readelf, "-h", str(elf)], capture_output=True, text=True)
+        elf_header = (hdr.stdout or hdr.stderr).strip()
+        if m := re.search(r"Machine:\s+(.+)", elf_header):
+            machine = m.group(1).strip()
+        if m := re.search(r"Entry point address:\s+(.+)", elf_header):
+            entry = m.group(1).strip()
+
+    strings_cmd = shutil.which("strings")
+    hints: list[str] = []
+    if strings_cmd:
+        sres = subprocess.run([strings_cmd, str(elf)], capture_output=True, text=True)
+        lines = (sres.stdout or "").splitlines()
+        pattern = re.compile(
+            r"(stm32|esp32|nucleo|disco|discovery|deno|board|product|idf|zephyr|arduino)",
+            re.IGNORECASE,
+        )
+        seen: set[str] = set()
+        for line in lines:
+            if pattern.search(line) and line not in seen:
+                seen.add(line)
+                hints.append(line)
+            if len(hints) >= 40:
+                break
+
+    return {
+        "elf_path": str(elf),
+        "disassembly_path": str(disasm_out),
+        "objdump": objdump,
+        "machine": machine,
+        "entry_point": entry,
+        "elf_header": elf_header,
+        "product_hints": hints,
+    }
 
 
 # ---------------------------------------------------------------------------
